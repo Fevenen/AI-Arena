@@ -1,7 +1,30 @@
+import { spawn } from 'node:child_process';
 import { createArenaApp } from './app.mjs';
 
 let app = null;
 let shuttingDown = false;
+
+function openBrowser(url) {
+  if (process.env.ARENA_OPEN_BROWSER !== '1' || process.env.ARENA_NO_BROWSER === '1') return;
+  setTimeout(() => {
+    try {
+      const command = process.platform === 'win32'
+        ? 'explorer.exe'
+        : process.platform === 'darwin'
+          ? 'open'
+          : 'xdg-open';
+      const child = spawn(command, [url], {
+        detached: true,
+        stdio: 'ignore',
+        windowsHide: true,
+      });
+      child.on('error', () => {});
+      child.unref();
+    } catch {
+      // 自动打开失败不阻止服务启动；终端里仍有可点击/复制的地址。
+    }
+  }, 650).unref();
+}
 
 async function main() {
   app = await createArenaApp({
@@ -20,6 +43,7 @@ async function main() {
   console.log(`  配置文件：${app.configStore.configPath}`);
   console.log('  按 Ctrl+C 停止服务');
   console.log('');
+  openBrowser(url);
 }
 
 async function shutdown(signal) {

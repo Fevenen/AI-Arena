@@ -112,6 +112,14 @@ const ignore = fs.readFileSync(path.join(ROOT, '.gitignore'), 'utf8');
 for (const rule of ['data/*', '!data/.gitkeep', '*.log', 'node_modules/']) {
   if (!ignore.includes(rule)) issues.push(`.gitignore 缺少：${rule}`);
 }
+// Windows CMD 对 LF-only 批处理可能报“命令语法不正确”；发布前强制检查。
+const cmdText = fs.readFileSync(path.join(ROOT, 'start.cmd'), 'utf8');
+if (!cmdText.includes('\r\n') || /(^|[^\r])\n/.test(cmdText)) {
+  issues.push('start.cmd 必须使用 CRLF 换行，否则 Windows 双击可能无法启动。');
+}
+if (cmdText.charCodeAt(0) === 0xfeff) {
+  issues.push('start.cmd 不应包含 UTF-8 BOM。');
+}
 const example = JSON.parse(fs.readFileSync(path.join(ROOT, 'config/arena.example.json'), 'utf8'));
 if (!Array.isArray(example.models) || !example.models.some((model) => model.baseUrl?.includes('127.0.0.1') || model.baseUrl?.includes('localhost'))) {
   issues.push('配置示例缺少本地模型示例。');
