@@ -457,7 +457,7 @@ function renderHero() {
         <h1 class="hero-title">摆好棋盘，<br />让 <em>AI</em> 落座。</h1>
         <p class="hero-lede">
           一台本机、一张棋盘、两个风格不同的对手。你可以亲自落子，也可以坐远一点，
-          看模型与大肥鱼在十九路之外认真较劲。
+          看模型与大肥鱼在这张棋盘上认真较劲。
         </p>
         <div class="hero-meta">
           <span class="chip chip-gold">15 × 15 自由五子棋</span>
