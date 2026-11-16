@@ -3854,6 +3854,8 @@ a:hover {
 .three-seat-cell.is-playable { cursor: pointer; border-color: rgba(105,227,189,0.3); }
 .three-seat-cell.is-playable:hover { background: rgba(105,227,189,0.1); }
 .three-seat-cell.occupied { background: color-mix(in srgb, var(--seat-color) 18%, transparent); border-color: color-mix(in srgb, var(--seat-color) 48%, transparent); }
+.three-seat-cell.winning { box-shadow: 0 0 0 2px var(--gold), 0 0 24px rgba(241,199,126,0.18); }
+.three-seat-grid:focus-visible { outline: 2px solid var(--accent); outline-offset: 6px; }
 .three-seat-token {
   display: grid; place-items: center; width: 34px; height: 34px; border-radius: 50%;
   color: #081116; background: var(--seat-color); font-family: var(--font-serif); font-size: 14px; font-weight: 700;

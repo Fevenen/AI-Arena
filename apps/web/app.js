@@ -1260,18 +1260,19 @@ function threeSeatSurface({ match, view, interactive, title = '对局桌面' }) 
         <div class="three-seat-legend">
           ${order.map((id) => `<span class="legend-seat" style="--seat-color:${escapeAttr(colorFor(id))}"><i></i>${escapeHtml(match.seats[id]?.colorName ?? id)}</span>`).join('')}
         </div>
-        <div class="three-seat-grid" role="group" aria-label="三席测试局桌面">
+        <div class="three-seat-grid" tabindex="0" role="group" aria-label="三席测试局桌面">
           ${Array.from({ length: 9 }, (_, index) => {
             const row = Math.floor(index / 3);
             const col = index % 3;
             const owner = view.board?.[row]?.[col] ?? null;
             const isLast = last?.cell === index + 1;
+            const winningCell = new Set(view.outcome?.line ?? []).has(index);
             const ownerDef = owner ? seatDefFor(match, owner) : null;
             const ownerShort = ownerDef?.shortName
               ?? match.seats[owner]?.colorName?.slice(0, 1)
               ?? match.seats[owner]?.name?.slice(0, 1)
               ?? '·';
-            return `<button class="three-seat-cell ${owner ? 'occupied' : ''} ${interactive && !owner ? 'is-playable' : ''}" type="button"
+            return `<button class="three-seat-cell ${owner ? 'occupied' : ''} ${interactive && !owner ? 'is-playable' : ''} ${winningCell ? 'winning' : ''}" type="button"
               style="--seat-color:${escapeAttr(owner ? colorFor(owner) : 'transparent')}"
               ${interactive && !owner ? `data-action="play-cell" data-cell="${index + 1}"` : 'disabled'}
               aria-label="第 ${index + 1} 格${owner ? `，${escapeHtml(match.seats[owner]?.colorName ?? owner)}` : '，空'}">
