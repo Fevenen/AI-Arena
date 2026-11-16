@@ -79,6 +79,7 @@ python -m unittest tests.test_arena tests.test_tavern tests.test_game_shared tes
 - 动作 `metrics`：attempts 1、elapsedMs 6532、moveMode `assisted`、failures 空；
 - 手动问题回答从白方身份出发，回答中明确“本鲸当然执白”；
 - 对局未暂停、无锁错误。
+- 新版浏览器 UI 直接连接真实桌宠与真实 KVMem：观战问答返回“本鲸当然是在看黑方先手啦……”，聊天标记「观战回答」，无脚本错误（见 `real-v2-dafeiyu-chat.png`）。
 
 ## 4. 错误分类
 
@@ -164,6 +165,7 @@ node scripts/ui-smoke.mjs
 - `data/ui-check/final-lobby-v2.png`
 - `data/ui-check/final-history-v2.png`
 - `data/ui-check/final-replay-v2.png`
+- `data/ui-check/real-v2-dafeiyu-chat.png`（真实桌宠 + 真实 KVMem + 新 UI）
 
 ## 9. 棋力固定局面
 
@@ -208,6 +210,7 @@ node scripts/model-benchmark.mjs
 - **长时间拔网线**未做；用真实 HTTP 断开、API 断开、超时和会话失效模拟；恢复路径已测。
 - **两个不同真实云模型**的完整长局未跑；两个独立模型配置、Key 隔离和终局由模拟 OpenAI 服务验证；单个本机 KVMem 真实落子/评测已验证。
 - **公开 v0.3.1 干净安装**只做了源码补丁 + 14 项测试，未在另一台机器上启动完整桌宠前端做人工联测；本机 v0.3.1 工作副本已真实联测。
+- 真实桌宠/真实 KVMem 已通过新浏览器 UI 问题链路；真实音色仍未人工听音。
 - 三座位插件只用于测试环境，不是第一版正式游戏。
 - 模型仍可能给出合法但糟糕的棋；规则辅助不是多步搜索。
 - 本机 Key 明文存放，仅适合单人本机。
