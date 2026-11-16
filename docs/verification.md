@@ -84,9 +84,11 @@ node scripts/ui-smoke.mjs
 - 大肥鱼棋手真实落子 `H8`，耗时约 4.1 s，公开想法：
   > 哼，本鲸先占天元，仆人可别拖后腿～
 - 网页真实操作：观战提问回答显示在聊天区；棋手日志与最后一手标记正确。
+- 全 AI 对局在网页中暂停后点「单步」：棋局只推进一手、保持暂停，再点「继续」恢复；界面显示 `step_done` 暂停原因与最后一手。
 - 真实截图：
   - `data/ui-check/real-01-dafeiyu-chat.png`
   - `data/ui-check/real-02-dafeiyu-player.png`
+  - `data/ui-check/allai-step.png`
 
 真实自动点评（经竞技场 `threat` 事件驱动、真实桌宠 + KVMem）：
 
