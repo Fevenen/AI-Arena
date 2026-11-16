@@ -81,7 +81,19 @@ python -m unittest tests.test_arena tests.test_tavern tests.test_game_shared tes
 - 对局未暂停、无锁错误。
 - 新版浏览器 UI 直接连接真实桌宠与真实 KVMem：观战问答返回“本鲸当然是在看黑方先手啦……”，聊天标记「观战回答」，无脚本错误（见 `real-v2-dafeiyu-chat.png`）。
 
-## 4. 错误分类
+## 4. DeepSeek 空内容卡局
+
+一次真实对局中（黑方大肥鱼、白方 DeepSeek Flash），白方在第 4 手前连续 3 次返回空文本，Arena 以 `ai_invalid_move` 暂停，随后用户结束对局。
+
+同一局面复现：
+
+- `max_tokens=300`：`finish_reason=length`，300 completion tokens 全部消耗为 reasoning，正文 0 字；
+- `max_tokens=1200`：正常返回 `{"move":"H6",...}`；
+- `max_tokens=3000`：也正常，但更慢。
+
+根因是 DeepSeek 默认思考模式把输出预算用在 `reasoning_content`，不是桌宠锁、断网或非法棋盘状态。Arena 已把模型落子输出预算提高到 1200，并用真实 DeepSeek 重新验证：一步合法 `H8`，约 863–999 ms。下一次同局面不会再因 300-token 预算空正文暂停。
+
+## 5. 错误分类
 
 模拟桌宠分别返回：
 

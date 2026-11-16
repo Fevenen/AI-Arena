@@ -185,6 +185,7 @@ test('模型非法落子有限重试后暂停，不再静默替换为机器人',
     assert.equal(paused.actionCount, 1);
     assert.equal(mock.requests.length, 2);
     assert.equal(paused.errors.length >= 1, true);
+    assert.equal(mock.requests.every((request) => request.body.max_tokens === 1200), true);
   } finally {
     await harness.cleanup();
     await mock.close();

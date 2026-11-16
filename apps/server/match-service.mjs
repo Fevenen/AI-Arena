@@ -1126,7 +1126,10 @@ export class MatchService {
       const completion = await requestModelCompletion(config, {
         messages,
         temperature: 0.2,
-        maxTokens: 300,
+        // DeepSeek 等默认开启思考模式的模型会先消耗 completion tokens 生成
+        // reasoning_content。输出上限太小会让正文为空且 finish_reason=length，
+        // 看起来像“模型返回了空内容”。给正文留足预算。
+        maxTokens: 1200,
         signal: context.controller.signal,
       });
       const parsed = game.parseModelMove(completion.text);
