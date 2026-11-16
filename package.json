@@ -1,0 +1,19 @@
+{
+  "name": "ai-arena",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "本机 AI 桌游竞技场：自由五子棋、模型对局、回放与大肥鱼接入",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "start": "node apps/server/index.mjs",
+    "test": "node --test --test-concurrency=1",
+    "verify": "node scripts/verify.mjs",
+    "check:public": "node scripts/check-public.mjs",
+    "smoke:ui": "node scripts/ui-smoke.mjs",
+    "mock:model": "node tools/mock-openai.mjs"
+  },
+  "license": "MIT"
+}

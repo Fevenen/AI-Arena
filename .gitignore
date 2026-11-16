@@ -1,0 +1,37 @@
+# 本机配置、密钥与运行数据
+data/*
+!data/.gitkeep
+*.local.json
+.env
+.env.*
+!/.env.example
+
+# 日志、缓存与测试产物
+logs/
+*.log
+coverage/
+test-results/
+.playwright/
+.cache/
+.tmp/
+tmp/
+
+# 编辑器与操作系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 构建/依赖缓存（本项目零运行时依赖，保留规则供扩展使用）
+node_modules/
+dist/
+build/
+out/
+*.tsbuildinfo
+
+# 用户可能放入的外部模型或素材
+*.gguf
+*.onnx
+*.safetensors
+*.bin

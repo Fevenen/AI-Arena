@@ -1,0 +1,38 @@
+{
+  "schemaVersion": 1,
+  "server": {
+    "host": "127.0.0.1",
+    "port": 8787
+  },
+  "models": [
+    {
+      "id": "local-kvmem-example",
+      "name": "本地 KVMem（示例）",
+      "provider": "openai-compatible",
+      "baseUrl": "http://127.0.0.1:18200/v1",
+      "modelId": "kvmem-polystrata-qwen35",
+      "apiKey": "local",
+      "timeoutMs": 120000,
+      "maxRetries": 2,
+      "isExample": true
+    }
+  ],
+  "dafeiyu": {
+    "bridgeUrl": "http://127.0.0.1:12393",
+    "apiBase": "/api/game/arena",
+    "token": "",
+    "origin": "",
+    "timeoutMs": 90000,
+    "healthIntervalMs": 15000
+  },
+  "match": {
+    "aiMoveDelayMs": 650,
+    "initialAiDelayMs": 900,
+    "autoCommentCooldownMs": 12000,
+    "maxModelRetries": 2,
+    "sseHeartbeatMs": 20000
+  },
+  "storage": {
+    "matchDir": "matches"
+  }
+}

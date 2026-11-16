@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#081116" />
+    <meta
+      name="description"
+      content="鲸局 · 本机 AI 桌游竞技场：自由五子棋、模型对战、大肥鱼观战与棋手接入、对局回放。"
+    />
+    <title>鲸局 · AI 桌游竞技场</title>
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <a class="skip-link" href="#main-content">跳到主要内容</a>
+    <div id="app" class="app-loading">
+      <div class="boot-mark" aria-hidden="true">
+        <span class="boot-stone boot-stone-black"></span>
+        <span class="boot-stone boot-stone-white"></span>
+      </div>
+      <p>正在摆好棋盘…</p>
+    </div>
+    <div id="modal-root"></div>
+    <div id="toast-root" class="toast-root" aria-live="polite" aria-atomic="false"></div>
+    <noscript>
+      <div class="noscript">竞技场网页需要启用 JavaScript。请允许本机页面运行脚本后刷新。</div>
+    </noscript>
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>

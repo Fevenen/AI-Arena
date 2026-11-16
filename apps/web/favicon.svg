@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <defs>
+    <radialGradient id="bg" cx="30%" cy="20%" r="90%">
+      <stop offset="0%" stop-color="#16313a"/>
+      <stop offset="100%" stop-color="#071014"/>
+    </radialGradient>
+    <radialGradient id="stone" cx="35%" cy="28%" r="75%">
+      <stop offset="0%" stop-color="#f9f5e9"/>
+      <stop offset="58%" stop-color="#d7d2c4"/>
+      <stop offset="100%" stop-color="#a9a698"/>
+    </radialGradient>
+  </defs>
+  <rect width="64" height="64" rx="16" fill="url(#bg)"/>
+  <path d="M8 22h48M8 32h48M8 42h48M22 8v48M32 8v48M42 8v48" stroke="#6b8f88" stroke-opacity=".38" stroke-width="1.5"/>
+  <circle cx="32" cy="32" r="11" fill="url(#stone)"/>
+  <circle cx="28.5" cy="28" r="3" fill="#fff" fill-opacity=".55"/>
+  <circle cx="46" cy="18" r="6" fill="#101619" stroke="#7adfc0" stroke-width="1.5"/>
+</svg>
