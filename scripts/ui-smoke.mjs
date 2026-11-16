@@ -18,6 +18,8 @@ import { createArenaApp } from '../apps/server/app.mjs';
 import { PROJECT_ROOT } from '../apps/server/config-store.mjs';
 import { createMockOpenAI } from '../tests/helpers/mock-openai.mjs';
 import { createMockDafeiyu } from '../tests/helpers/mock-dafeiyu.mjs';
+import { gomokuGame } from '../packages/games/gomoku/index.mjs';
+import { threeSeatGame } from '../tests/fixtures/three-seat-game.mjs';
 
 const SHOT_DIR = path.join(PROJECT_ROOT, 'data', 'ui-check');
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -329,6 +331,15 @@ async function main() {
       return true;
     })()`);
   };
+  const setViewport = async (width, height = 1180) => {
+    await browser.cdp.send('Emulation.setDeviceMetricsOverride', {
+      width,
+      height,
+      deviceScaleFactor: 1,
+      mobile: false,
+    });
+    await sleep(200);
+  };
   const screenshot = async (name) => {
     await sleep(240);
     const result = await browser.cdp.send('Page.captureScreenshot', {
@@ -354,6 +365,7 @@ async function main() {
     app = await createArenaApp({
       configPath,
       logger: { info() {}, warn() {}, error() {} },
+      gamePlugins: [gomokuGame, threeSeatGame],
     });
     await app.start({ port: 0, host: '127.0.0.1' });
     browser = await launchBrowser(edgePath, `${app.publicUrl}/#/lobby`);
@@ -366,9 +378,13 @@ async function main() {
       }
     });
 
-    await waitPage("document.querySelector('.lobby-hero') !== null", 10000, '开桌页未渲染');
+    await waitPage("document.querySelector('.library-page') !== null", 10000, '桌游库未渲染');
     await screenshot('01-lobby.png');
-    assert.match(await evaluate('document.body.innerText'), /摆好棋盘/);
+    const lobbyText = await evaluate('document.body.innerText');
+    assert.match(lobbyText, /桌游库/);
+    assert.match(lobbyText, /自由五子棋/);
+    assert.equal(/鲸局/.test(lobbyText), false);
+    assert.equal(await evaluate("document.querySelector('.lobby-hero') === null"), true);
 
     // ---- 模型管理：通过真实 DOM 新增并测试连接 ----
     await click('a[href="#/models"]');
@@ -443,7 +459,7 @@ async function main() {
 
     // ---- 大肥鱼观战：手动问答、语音开关、重连 ----
     await click('a[href="#/lobby"]');
-    await waitPage("document.querySelector('.lobby-hero') !== null");
+    await waitPage("document.querySelector('.library-page') !== null");
     await click('input[data-change="lobby-observer"]');
     await waitPage("document.querySelector('input[data-change=lobby-observer]').checked === true", 5000, '未勾选大肥鱼观战');
     await click('[data-action="start-match"]');
@@ -473,7 +489,7 @@ async function main() {
     app.configStore.config.match.initialAiDelayMs = 3000;
     app.configStore.config.match.aiMoveDelayMs = 3000;
     await click('a[href="#/lobby"]');
-    await waitPage("document.querySelector('.lobby-hero') !== null", 10000, '从观战对局返回开桌失败');
+    await waitPage("document.querySelector('.library-page') !== null", 10000, '从观战对局返回桌游库失败');
     await setSelect('select[data-change="seat-kind"][data-seat="black"]', 'dafeiyu');
     await waitPage("document.querySelector('select[data-change=seat-kind][data-seat=black]').value === 'dafeiyu'", 5000, '黑方未切换为大肥鱼');
     const autoChecked = await evaluate("document.querySelector('input[data-change=lobby-auto]').checked");
@@ -504,7 +520,7 @@ async function main() {
     app.configStore.config.match.initialAiDelayMs = 800;
     app.configStore.config.match.aiMoveDelayMs = 120;
     await click('a[href="#/lobby"]');
-    await waitPage("document.querySelector('.lobby-hero') !== null");
+    await waitPage("document.querySelector('.library-page') !== null");
     await setSelect('select[data-change="seat-kind"][data-seat="black"]', 'bot');
     await waitPage("document.querySelector('select[data-change=seat-kind][data-seat=black]').value === 'bot'", 5000, '黑方未切换为机器人');
     const observerChecked = await evaluate("document.querySelector('input[data-change=lobby-observer]').checked");
@@ -516,10 +532,80 @@ async function main() {
     const autoMatchId = await evaluate("location.hash.split('/').at(-1)");
     matchIds.push(autoMatchId);
     await waitMatch(autoMatchId, (match) => match.dafeiyu?.status === 'connected', 15000, '自动点评大肥鱼未连接');
+    // 全 AI 快速推进时输入中文：组词期间 SSE 更新必须延后，输入节点、焦点和光标不能丢。
+    await waitPage("document.querySelector('#chat-input') !== null && !document.querySelector('#chat-input').disabled", 8000, '聊天输入框没有启用');
+    await evaluate(`(() => {
+      const input = document.querySelector('#chat-input');
+      input.focus();
+      input.value = '全AI推进中测试';
+      input.setSelectionRange(4, 4);
+      window.__imeInput = input;
+      input.dispatchEvent(new CompositionEvent('compositionstart', { bubbles: true, data: '测试' }));
+      input.value = '全AI推进中测试继续';
+      input.setSelectionRange(6, 6);
+      return true;
+    })()`);
+    await waitMatch(autoMatchId, (match) => match.actionCount >= 2, 10000, '全 AI 没有继续推进');
+    await sleep(220);
+    const imeState = await evaluate(`(() => {
+      const input = document.querySelector('#chat-input');
+      return {
+        sameNode: input === window.__imeInput,
+        active: document.activeElement.id,
+        value: input.value,
+        selectionStart: input.selectionStart,
+        composing: input.closest('form') !== null,
+      };
+    })()`);
+    assert.deepEqual(imeState, {
+      sameNode: true,
+      active: 'chat-input',
+      value: '全AI推进中测试继续',
+      selectionStart: 6,
+      composing: true,
+    });
+    await evaluate(`(() => {
+      const input = document.querySelector('#chat-input');
+      input.dispatchEvent(new CompositionEvent('compositionend', { bubbles: true, data: '继续' }));
+      return true;
+    })()`);
+    await sleep(200);
+    await screenshot('11-ime-composing.png');
     await waitMatch(autoMatchId, (match) => (match.chat ?? []).some((item) => item.kind === 'comment'), 45000, '没有产生自动点评');
     await waitPage("document.querySelector('.chat-message.dafeiyu .chat-bubble') !== null", 8000, '自动点评未显示');
     await screenshot('11-auto-comment.png');
     await endMatchIfActive(autoMatchId);
+
+    // ---- 三座位测试插件：游戏库选择、三席行动、结算、回放 ----
+    await click('a[href="#/lobby"]');
+    await waitPage("document.querySelector('.library-page') !== null", 10000, '三席测试返回桌游库失败');
+    await click('[data-action="select-game"][data-game="three-seat-test"]');
+    await waitPage("document.querySelector('select[data-change=seat-kind][data-seat=sun]') !== null", 8000, '三席设置未出现');
+    await setSelect('select[data-change="seat-kind"][data-seat="sun"]', 'bot');
+    await setSelect('select[data-change="seat-kind"][data-seat="moon"]', 'bot');
+    await setSelect('select[data-change="seat-kind"][data-seat="star"]', 'bot');
+    await click('[data-action="start-match"]');
+    await waitPage("location.hash.startsWith('#/match/') && document.querySelector('.three-seat-grid') !== null", 12000, '三席对局未打开');
+    const threeSeatId = await evaluate("location.hash.split('/').at(-1)");
+    matchIds.push(threeSeatId);
+    await waitMatch(threeSeatId, (match) => match.status === 'finished', 15000, '三席对局没有结束');
+    assert.equal(await evaluate("document.querySelectorAll('.match-seat').length"), 3);
+    assert.equal(await evaluate("document.querySelectorAll('.three-seat-cell').length"), 9);
+    await screenshot('12-three-seat.png');
+    await click('a[href^="#/replay/"]');
+    await waitPage("document.querySelector('.replay-page') !== null && document.querySelectorAll('.three-seat-cell').length === 9", 10000, '三席回放未打开');
+    await screenshot('13-three-replay.png');
+    await click('a[href="#/lobby"]');
+    await waitPage("document.querySelector('.library-page') !== null", 10000, '三席回放返回桌游库失败');
+
+    // ---- 常见 Windows 宽度与窄窗口 ----
+    await setViewport(900);
+    await screenshot('14-lobby-900.png');
+    assert.equal(await evaluate('document.documentElement.scrollWidth <= window.innerWidth + 2'), true);
+    await setViewport(480);
+    await screenshot('15-lobby-480.png');
+    assert.equal(await evaluate('document.documentElement.scrollWidth <= window.innerWidth + 2'), true);
+    await setViewport(1440);
 
     // ---- 公开配置与安全 ----
     const finalModels = await api('/api/models');

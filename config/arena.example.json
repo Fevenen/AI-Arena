@@ -23,7 +23,8 @@
     "token": "",
     "origin": "",
     "timeoutMs": 90000,
-    "healthIntervalMs": 15000
+    "healthIntervalMs": 15000,
+    "sessionReleaseMs": 20000
   },
   "match": {
     "aiMoveDelayMs": 650,

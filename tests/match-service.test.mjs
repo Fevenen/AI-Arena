@@ -136,7 +136,9 @@ test('两个独立模型配置互打，完整终局，模型 Key 只用于各自
       message: '双模型对局未结束',
     });
     const finished = harness.service.getMatch(match.id);
-    assert.equal(finished.result, 'black_win');
+    assert.equal(finished.result, 'win');
+    assert.equal(finished.resultGroup, 'win');
+    assert.equal(finished.winnerSeat, 'black');
     assert.equal(finished.actionCount, 9);
     assert.equal(finished.actions.filter((item) => item.source === 'model').length, 9);
     assert.equal(blackMock.requests.length, 5);

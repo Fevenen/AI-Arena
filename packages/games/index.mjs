@@ -1,28 +1,40 @@
 import gomokuGame from './gomoku/index.mjs';
 
 /**
- * 注册桌游：这是新增游戏的唯一注册位置。
- * 每个插件必须通过 packages/core/game-api.mjs 的接口校验。
+ * 注册桌游：这是新增正式游戏的唯一注册位置。
+ * 测试/开发环境可以将额外的插件列表传给 createArenaApp，不需要改大厅和调度器。
  */
 export const GAME_PLUGINS = Object.freeze([gomokuGame]);
 
 export const GAME_MAP = new Map(GAME_PLUGINS.map((game) => [game.id, game]));
 
-export function listGames() {
-  return GAME_PLUGINS.map((game) => ({
+export function serializeGame(game) {
+  return {
     id: game.id,
     name: game.name,
     shortName: game.shortName,
     description: game.description,
     rulesVersion: game.rulesVersion,
-    seats: game.seats,
+    minPlayers: game.minPlayers,
+    maxPlayers: game.maxPlayers,
+    seats: game.seats.map((seat) => ({
+      id: seat.id,
+      name: seat.name,
+      order: seat.order ?? 0,
+      color: seat.color ?? null,
+      shortName: seat.shortName ?? seat.name,
+    })),
     rulesText: game.rulesText,
     coordinateSystem: game.coordinateSystem,
     ui: game.ui,
     supportsSpectator: game.supportsSpectator,
-  }));
+  };
 }
 
-export function getGame(id) {
-  return GAME_MAP.get(id) ?? null;
+export function listGames(plugins = GAME_PLUGINS) {
+  return plugins.map(serializeGame);
+}
+
+export function getGame(id, plugins = GAME_PLUGINS) {
+  return plugins.find((game) => game.id === id) ?? null;
 }

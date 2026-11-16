@@ -1,168 +1,213 @@
 # 验证记录
 
-记录时间：2026-11-16（本机 Windows / Node.js 24.16.0 / Edge headless）。
-
-本文件区分**自动化模拟验证**和**真实本机服务联测**，避免把模拟结果写成真实模型或真实语音结果。
+验证日期：2026-11-16。环境为 Windows 11、Node.js 24.16.0，本机 KVMem 与大肥鱼桌宠在线。竞技场和大肥鱼使用隔离配置/临时数据做破坏性测试；本机正式配置、Key 和已有棋谱未用于模拟测试。
 
 ## 1. 自动化测试
 
-### 竞技场 Node 测试
+### AI Arena
 
 ```powershell
 node --test --test-concurrency=1
 ```
 
-结果：**35 项通过，0 失败**。
+结果：**59 项通过，0 失败**。覆盖：
 
-覆盖：
+- 五子棋坐标、规则、长连、和棋、终局；
+- 严格 JSON 解析、歧义/多动作/截断拒绝；
+- 模型连接成功、空 Key/Bearer Key、认证/地址/模型错误、完整响应体超时和取消；
+- 大写小写/事件去重、机器人和规则辅助；
+- 服务调度、重试、暂停/继续/单步、迟到回复丢弃；
+- 大肥鱼关键卡局重放、棋手落子优先、忙/超时/解析/非法动作分类；
+- 后台点评失败不判掉线、会话释放、语音取消、迟到回答作废；
+- 三座位插件、逐座位行动、私有目标结算、公开 API/SSE/导出不泄露；
+- 规则版本变化后快照回放；
+- HTTP API、历史过滤、导出和模型 Key 不泄露。
 
-- 五子棋：坐标、黑先、四方向五连、六连、重复落点、越界、非当前玩家、满盘和棋、终局后禁止落子、关键事件。
-- 模型：Base URL 规范化、空 Key、Bearer local、401/403、模型不存在、地址不可达、超时、错误脱敏、内置机器人。
-- API：模型 Key 不回传、HTTP Origin 检查、SSE、真人落子、暂停/继续、历史筛选、导出、重启后回放、BOM 配置兼容。
-- 调度：真人对模型、两个独立模型配置互打、非法落子有限重试后暂停、暂停后迟到回复不落子、全 AI 暂停/单步/继续、重启后活动对局处理。
-- 大肥鱼模拟桥：观战手动问答、自动点评、去重、冷却、语音开关、棋手落子、掉线暂停、重连继续、观众离开后丢弃迟到点评。
-- 配置：UTF-8 BOM、`matchDir` 相对配置文件目录解析。
+### 大肥鱼
 
-### 大肥鱼 Python 回归
-
-运行环境为大肥鱼现有 Python 3.10 虚拟环境：
-
-```powershell
-$env:PYTHONPATH = "<大肥鱼发布源码目录>"
-& "<Python>" -m unittest tests.test_arena tests.test_tavern tests.test_game_shared tests.test_game_voice -v
-```
-
-结果：**42 项通过，0 失败**，其中：
-
-- 新增 Arena 桥：10 项。
-- 原有酒馆、共享上下文、语音回归：32 项。
-
-大肥鱼 `/api/health` 重启后返回 `arena_game: true`，首页仍返回 HTTP 200，原有接口未移除。
-
-### 公开文件检查
+Arena 专项：
 
 ```powershell
-node scripts/check-public.mjs
+python -m unittest tests.test_arena -v
 ```
 
-结果：通过。检查了 54 个公开源码/文档/脚本文件：
+结果：**14/14 通过**。
 
-- 无固定开发盘符路径或用户目录绝对路径；
-- 无真实 `sk-`/GitHub Token/私钥形态；
-- 无 `data/` 下运行数据；
-- 必需的依赖清单、锁文件、配置示例和文档存在。
+受影响回归（Arena + 酒馆 + 共享上下文 + 语音 + 回放 + voice regressions）：
 
-## 2. 浏览器端到端
+```powershell
+python -m unittest tests.test_arena tests.test_tavern tests.test_game_shared tests.test_game_voice tests.test_playback_ack tests.test_voice_regressions -v
+```
 
-### 模拟服务（独立临时数据 + 临时端口）
+结果：**52/52 通过**。
+
+干净 v0.3.1 补丁验收：
+
+- 用 `git archive v0.3.1` 取得不含本机改动的发布源码；
+- 应用 `integrations/dafeiyu-v0.3.1-arena-bridge/`；
+- **14/14 Arena 测试通过**。
+
+完整 `unittest discover` 的 148 项在本机运行中桌宠/多进程锁环境下出现过个别旧测试抖动（`cross_process_claim`、临时提醒锁、部分 gateway mock 未触发）；单独重跑 `test_cross_process_claim` 通过。未把该环境抖动计入 Arena 通过数，也未据此声称 148 项全通过。
+
+## 2. 关键卡局复现
+
+用模拟大肥鱼和真实棋谱关键局面构造：黑 `H8/I7/G9/J6`，白 `H7/I8/J9`，随后黑 `F10`。第 7 手后轮到白方大肥鱼，且黑方 `F10`、`K5` 都是一步成五点。
+
+结果：
+
+- 第 7 手后没有启动会抢锁的自动点评；
+- 白方大肥鱼合法走 `K5`，棋局不暂停；
+- 黑方 `F10` 自然成五，终局 `win/black`；
+- 9 手全部保存，回放 10 个视图（初始 + 9 手）；
+- 终局 Dafeiyu 请求 `role=player`、`seat=white`，事件摘要含真实 `F10`，没有 `undefined`；
+- 全程没有 429/“另一局”错误暂停。
+
+对应测试：`tests/dafeiyu-priority.test.mjs`。
+
+## 3. 真实桥锁竞争与结构化落子
+
+直接对本机真实大肥鱼桥/KVMem：
+
+- 先发起玩家点评，250 ms 后请求白/黑座位落子；
+- 落子约 **4.0 s** 返回，合法 JSON `{"move":"H8",...}`；
+- 被抢占的点评返回 `comment_skipped`，未阻塞落子；
+- 落子请求使用 `response_format: json_object`，模型返回单个 JSON 对象；Arena 严格解析后接受。
+
+真实 Arena 对局（隔离数据）：
+
+- 真人黑 `H8` 后，大肥鱼执白在约 **6.6 s** 返回 `H9`；
+- 动作 `metrics`：attempts 1、elapsedMs 6532、moveMode `assisted`、failures 空；
+- 手动问题回答从白方身份出发，回答中明确“本鲸当然执白”；
+- 对局未暂停、无锁错误。
+
+## 4. 错误分类
+
+模拟桌宠分别返回：
+
+| 情形 | 结果 |
+| --- | --- |
+| HTTP 429 / `player_busy` | `dafeiyu_busy`，连接仍为 connected，不误判断线 |
+| 自由文本 / 非 JSON | `dafeiyu_output_invalid`，有限重试后暂停 |
+| 合法 JSON 但占点 | `dafeiyu_invalid_move`，有限重试后暂停 |
+| 响应正文超时 | `dafeiyu_timeout`，连接仍 connected |
+| 后台自动点评失败 | 记录 `dafeiyu_comment` 错误，不暂停、不判掉线 |
+| 离开/断开时迟到回答 | 回答被取消，不写入旧局聊天 |
+
+## 5. 超时与取消
+
+回归模拟服务先发响应头，再故意延迟正文：
+
+- 普通模型客户端在 220 ms 超时设置下约 245 ms 结束，错误 `timeout`；
+- 普通模型正文读取阶段主动取消约 118 ms，错误 `cancelled`；
+- 大肥鱼客户端约 185/104 ms 分别验证超时和取消。
+
+证明计时器覆盖完整响应体，而不是收到响应头就撤掉。
+
+## 6. 三座位/私有信息/回放版本
+
+三座位测试插件（`tests/fixtures/three-seat-game.mjs`）：
+
+- 3 个座位 `sun/moon/star`，按顺序行动；
+- 全 AI 对局 8–9 手自然结束；
+- 私有目标格参与九格满盘结算：构造局面仅有 `moon` 达成私有目标，结果 `winnerSeat=moon`；
+- 公开 API、SSE 首帧、导出均不含 `privateTargets`/`secretNote`/`SUN-SECRET`；
+- 模型提示含自己的私有目标，不含另外两个座位；
+- 用 `git archive` 版相同数据、把插件 `rulesVersion` 改为 `9.9.9` 后，旧局仍从保存的权威快照打开。
+
+## 7. 历史迁移
+
+本机原有 4 局真实记录在切到 v0.2.0 后：
+
+- 仍全部出现在对局记录；
+- 3 局 aborted、1 局 99 手 finished；
+- 自动补建快照：100、14、8、8 个视图（初始 + 手数）；
+- 旧 `black_win`/`aborted` 结果和标签保留，历史筛选按“有胜负/已中止”归类；
+- 旧回放可打开，按 100 步、时间轴、上一手/下一手操作；
+- 未出现 Key 或私有状态。
+
+## 8. 浏览器 UI
 
 ```powershell
 node scripts/ui-smoke.mjs
 ```
 
-结果：通过。脚本实际用 Edge headless 打开页面并完成：
+结果通过，共 5 个测试对局，16 张冒烟截图（另 3 张正式数据截图）。实际点击/验证：
 
-- 新增模型、测试连接、保存；
-- 快速开桌、点击 `H8`、机器人回手；
-- 暂停、继续、结束；
-- 历史列表、回放上一手/下一手；
-- 邀请大肥鱼观战、手动提问、自动点评、语音开关；
-- 断开、重连；
-- 大肥鱼棋手掉线暂停、重连、重试、落子及公开想法；
+- 桌游库、模型管理、快速试玩、落子、暂停、继续、结束；
+- 对局记录、回放上一手/下一手、三座位回放；
+- 大肥鱼观战问题、自动点评、语音开关、断开/重连；
+- 大肥鱼棋手断开暂停、重连、重试、真实落子/公开想法；
 - 全 AI 自动点评；
-- 页面无 JavaScript 异常。
+- 三座位测试插件在游戏库出现、3 个座位、9 个格子、终局、回放；
+- 全 AI 快速推进时输入中文：组词期间 DOM 输入节点未被替换，焦点、值、光标保持；compositionend 后继续；
+- 900 px、480 px 宽度无横向溢出；
+- 浏览器无脚本异常。
 
-大肥鱼模拟服务统计：1 次自动点评、2 次问答、1 次棋手落子、1 次语音入队。截图位于 `data/ui-check/`（运行数据，不进入 Git）。
+截图：
 
-### 真实本机服务 + 真实网页
+- `data/ui-check/01-lobby.png`
+- `data/ui-check/02-model-modal.png`
+- `data/ui-check/03-models.png`
+- `data/ui-check/04-match.png`
+- `data/ui-check/05-paused.png`
+- `data/ui-check/06-history.png`
+- `data/ui-check/07-replay.png`
+- `data/ui-check/08-dafeiyu-chat.png`
+- `data/ui-check/09-dafeiyu-paused.png`
+- `data/ui-check/10-dafeiyu-player.png`
+- `data/ui-check/11-ime-composing.png`
+- `data/ui-check/11-auto-comment.png`
+- `data/ui-check/12-three-seat.png`
+- `data/ui-check/13-three-replay.png`
+- `data/ui-check/14-lobby-900.png`
+- `data/ui-check/15-lobby-480.png`
+- `data/ui-check/final-lobby-v2.png`
+- `data/ui-check/final-history-v2.png`
+- `data/ui-check/final-replay-v2.png`
 
-真实大肥鱼桌宠后端 + 真实本机 KVMem + 当前网页：
-
-- 模型连接测试成功，耗时 482 ms。
-- 大肥鱼观战手动问题真实回答，耗时约 3.6 s，示例回答：
-  > （翻白眼）现在棋盘空荡荡的，连个鬼影子都没有，哪来的威胁？……
-- 大肥鱼棋手真实落子 `H8`，耗时约 4.1 s，公开想法：
-  > 哼，本鲸先占天元，仆人可别拖后腿～
-- 网页真实操作：观战提问回答显示在聊天区；棋手日志与最后一手标记正确。
-- 全 AI 对局在网页中暂停后点「单步」：棋局只推进一手、保持暂停，再点「继续」恢复；界面显示 `step_done` 暂停原因与最后一手。
-- 真实截图：
-  - `data/ui-check/real-01-dafeiyu-chat.png`
-  - `data/ui-check/real-02-dafeiyu-player.png`
-  - `data/ui-check/allai-step.png`
-
-真实自动点评（经竞技场 `threat` 事件驱动、真实桌宠 + KVMem）：
-
-- 事件 key：`threat:white:I12`
-- 回复示例：
-  > （瞪大眼睛）白方下在 I12 直接成五，黑方这防守简直像本鲸的尾巴一样松垮！
-- 同一事件 key 不重复；语音关闭时未播放。
-
-真实语音链路：
-
-- 启动临时桌宠网页客户端后，桌宠 `/api/health` 的 `clients` 为 1。
-- 通过桌宠 Arena `speak` 接口提交中文文本，返回 `voiceStatus: "queued"`。
-- 桌宠日志出现 Queuing TTS task、Generating audio，随后音频缓存被清理；证明文本进入了现有 TTS 播放队列。
-- 未进行人工耳机听音；真实语音是否“好听”不属于本次自动验收。
-- 桌宠无客户端时返回 `no_client`，文字仍显示。
-
-## 3. 全新目录发布验收
-
-完整源码复制到含**中文和空格**的临时目录，不含开发目录的 `data/`、`.git`、截图或运行记录。
-
-操作：
-
-1. 从另一个工作目录（`C:\Windows\System32`）按绝对路径启动：
-   ```powershell
-   node "<全新目录>\apps\server\index.mjs"
-   ```
-2. 首次启动在全新目录生成 `data/arena.json` 和 `data/matches/`。
-3. 不安装任何 npm 依赖。
-4. 用内置机器人完成一局：44 手，白方胜。
-5. 启动同一份全新源码内的模拟模型，新增配置并测试连接成功。
-6. 用「模拟模型 vs 内置机器人」完成一局：16 手，白方胜。
-7. 在浏览器打开全新目录服务的历史和回放；截图保存在 `data/ui-check/fresh-*.png`。
-8. 停止服务，换到另一个工作目录重启；两局历史仍存在，回放步数分别为 44 和 16。
-9. 在全新目录运行 `node scripts/check-public.mjs`：通过（54 个文件）。
-
-说明：全新目录验收使用的是**模拟模型**；真实 KVMem / 大肥鱼联测使用当前本机服务，见上一节。
-
-## 4. 模拟与真实对照
-
-| 项目 | 模拟/自动化 | 真实本机 |
-| --- | --- | --- |
-| 真人对模型、非法落子、暂停/迟到回复 | 通过（模拟模型） | 通过（KVMem 连接与移动测试；完整对局由自动测试覆盖） |
-| 两个独立模型配置对打 | 通过（两个独立模拟服务） | 未做长时间双真实云端/本地模型对打 |
-| Bearer local、空 Key | 通过 | KVMem 示例用 `local`；空 Key 为模拟服务验证 |
-| 大肥鱼观战问答 | 通过（模拟桌宠） | 通过（真实桌宠 + KVMem + 真实网页） |
-| 大肥鱼棋手落子 | 通过（模拟桌宠） | 通过（真实桌宠 + KVMem + 真实网页） |
-| 自动点评事件 | 通过（模拟桌宠） | 通过（真实桌宠 + KVMem，经 Arena 事件） |
-| 掉线暂停/重连 | 通过（模拟桌宠） | 通过接口断开/重连路径；真实网络断线未长时间压测 |
-| 语音开关/入队 | 通过（模拟桌宠） | TTS 真实入队并合成；未人工听音 |
-| 重启后回放 | 通过（开发目录和全新目录） | 通过 |
-| 大肥鱼无客户端语音状态 | 通过 | 返回 `no_client`，文字正常 |
-| 全新目录安装 | 实际执行 | — |
-
-## 5. 已知限制
-
-- 第一版正式桌游只有自由五子棋；新桌游需要按 `docs/add-game.md` 实现插件，若要交互桌面还需注册网页组件。
-- 大肥鱼真实语音的“声音效果”未做人工试听验收；已验证进入现有 TTS 队列并合成。
-- 模型 Key 在本机 `data/arena.json` 中明文保存；项目已通过 .gitignore 和 API 脱敏防止外泄，但不建议共享同一 Windows 账户。
-- 大肥鱼游戏模型沿用其 bridge 的 KVMem 游戏模型配置；与主聊天模型是两条配置路径。
-- 自动点评只处理插件可识别的关键事件，不是对每一步都解说。
-- 本机应用默认无登录系统；不要将端口暴露到公网。
-
-## 6. 复现命令
+## 9. 棋力固定局面
 
 ```powershell
-node --test --test-concurrency=1
-node scripts/check-public.mjs
-node scripts/ui-smoke.mjs          # 需要 Edge/Chrome，使用临时数据
-node tools/mock-openai.mjs         # 另开终端，供手动测试模型
+node scripts/model-benchmark.mjs
 ```
 
-大肥鱼回归：
+真实 KVMem 结果：
 
-```powershell
-$env:PYTHONPATH = "<大肥鱼发布源码目录>"
-& "<Python>" -m unittest tests.test_arena tests.test_tavern tests.test_game_shared tests.test_game_voice -v
-```
+| 方案 | 战术正确 | 合法 | 平均耗时 | 卡局 |
+| --- | --- | --- | --- | --- |
+| 内置机器人 | 4/4 | 4/4 | 4 ms | 0 |
+| KVMem 纯模型 | 1/4 | 4/4 | 1432 ms | 0 |
+| KVMem 规则辅助 | 4/4 | 4/4 | 3897 ms | 0 |
+
+历史 J9 关键局面中，内置机器人选择 **J6**，与用户观察一致，并制造双杀。KVMem 纯模型在一步成五/必堵局面选择 E2（合法但非最优），规则辅助选择 E1；纯模型在双杀局面选择 G8，规则辅助选择 F10。报告保存在 `data/benchmarks/`（Git 忽略）。
+
+## 10. 干净目录安装
+
+- 发布源复制到含中文和空格的临时目录，排除 `data/`、`.git/`、日志和缓存；
+- 源内公开检查：**67 个文件通过**；
+- 从 `C:\Windows\System32` 工作目录、使用绝对路径启动；
+- 默认生成 `data/`，端口 8899（`ARENA_PORT` 覆盖）；
+- 新增模拟模型，连接测试 13 ms；
+- 模拟模型（黑，规则辅助）对内置机器人（白）自然终局：10 手，`win`；
+- 回放 11 个视图；
+- 重启后同一回放仍为 11 个视图，历史 1 局；
+- 导出不含 Key。
+- 最终公开文件数为 67。
+
+## 11. 大肥鱼补丁
+
+- 干净 `v0.3.1` tag 应用 `runtime/routes.patch` 和三个桥文件；
+- `tests/test_arena.py` 14/14 通过；
+- 本机 release 与运行副本哈希一致；
+- 运行健康：`arena_game:true`、`clients:0`；
+- 真实桥：落子优先、点评让位、真实落子/问答、会话 leave 已验证。
+
+## 12. 仍需人工/环境验收
+
+- **真实音色**未人工听音；已验证文字进入 TTS 队列、按会话取消状态、日志中的合成/清理。听到的实际音质不属于自动验收。
+- **长时间拔网线**未做；用真实 HTTP 断开、API 断开、超时和会话失效模拟；恢复路径已测。
+- **两个不同真实云模型**的完整长局未跑；两个独立模型配置、Key 隔离和终局由模拟 OpenAI 服务验证；单个本机 KVMem 真实落子/评测已验证。
+- **公开 v0.3.1 干净安装**只做了源码补丁 + 14 项测试，未在另一台机器上启动完整桌宠前端做人工联测；本机 v0.3.1 工作副本已真实联测。
+- 三座位插件只用于测试环境，不是第一版正式游戏。
+- 模型仍可能给出合法但糟糕的棋；规则辅助不是多步搜索。
+- 本机 Key 明文存放，仅适合单人本机。

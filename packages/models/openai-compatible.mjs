@@ -190,12 +190,40 @@ async function createCompletion(config, { messages, temperature = 0.2, maxTokens
       }),
       signal: controller.signal,
     });
+
+    // 必须在响应正文完整读取后再撤掉计时器和外部取消监听。
+    // 部分服务会先返回响应头、再长时间等待模型生成正文。
+    const bodyText = await response.text();
+    if (!response.ok) throw errorFromResponse(response, bodyText, config);
+    let data;
+    try {
+      data = JSON.parse(bodyText);
+    } catch {
+      throw new ModelError('invalid_response', '模型返回的不是 JSON。', {
+        stage: 'response',
+        detail: redactSecret(shorten(bodyText, 300), config.apiKey),
+      });
+    }
+    const content = extractContent(data);
+    if (typeof content !== 'string') {
+      throw new ModelError('invalid_response', '模型返回缺少 choices[0].message.content。', {
+        stage: 'response',
+        detail: redactSecret(shorten(bodyText, 300), config.apiKey),
+      });
+    }
+    return {
+      text: content,
+      raw: data,
+      endpoint,
+      usage: data.usage ?? null,
+    };
   } catch (error) {
+    if (error instanceof ModelError) throw error;
     if (timedOut) {
-      throw new ModelError('timeout', `连接超时：模型在 ${Math.round(timeoutMs / 1000)} 秒内没有返回。`, {
+      throw new ModelError('timeout', `连接超时：模型在 ${Math.round(timeoutMs / 1000)} 秒内未完成响应。`, {
         stage: 'network',
         retryable: true,
-        detail: redactSecret(error.message, config.apiKey),
+        detail: redactSecret(error?.message ?? '', config.apiKey),
       });
     }
     if (cancelled) {
@@ -206,31 +234,6 @@ async function createCompletion(config, { messages, temperature = 0.2, maxTokens
     clearTimeout(timer);
     if (signal) signal.removeEventListener('abort', onAbort);
   }
-
-  const bodyText = await response.text();
-  if (!response.ok) throw errorFromResponse(response, bodyText, config);
-  let data;
-  try {
-    data = JSON.parse(bodyText);
-  } catch {
-    throw new ModelError('invalid_response', '模型返回的不是 JSON。', {
-      stage: 'response',
-      detail: redactSecret(shorten(bodyText, 300), config.apiKey),
-    });
-  }
-  const content = extractContent(data);
-  if (typeof content !== 'string') {
-    throw new ModelError('invalid_response', '模型返回缺少 choices[0].message.content。', {
-      stage: 'response',
-      detail: redactSecret(shorten(bodyText, 300), config.apiKey),
-    });
-  }
-  return {
-    text: content,
-    raw: data,
-    endpoint,
-    usage: data.usage ?? null,
-  };
 }
 
 async function testConnection(config, { signal } = {}) {

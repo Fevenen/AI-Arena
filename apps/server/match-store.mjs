@@ -1,6 +1,13 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
+function resultGroup(value) {
+  if (value === 'win' || value === 'black_win' || value === 'white_win') return 'win';
+  if (value === 'draw') return 'draw';
+  if (value === 'aborted') return 'aborted';
+  return value || '';
+}
+
 function summarize(match) {
   return {
     id: match.id,
@@ -14,8 +21,12 @@ function summarize(match) {
     updatedAt: match.updatedAt,
     outcome: match.outcome,
     result: match.result,
+    resultGroup: resultGroup(match.result),
     resultLabel: match.resultLabel,
+    winnerSeat: match.winnerSeat ?? match.outcome?.winnerSeat ?? null,
+    winnerName: match.winnerName ?? null,
     seats: match.seats,
+    seatOrder: Array.isArray(match.seatOrder) ? match.seatOrder : Object.keys(match.seats ?? {}),
     moveCount: Array.isArray(match.actions) ? match.actions.length : 0,
     modeLabel: match.modeLabel,
     dafeiyuEnabled: Boolean(match.dafeiyu?.enabled),

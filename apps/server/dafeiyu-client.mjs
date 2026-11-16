@@ -60,17 +60,66 @@ export class DafeiyuClient {
       if (signal.aborted) onAbort();
       else signal.addEventListener('abort', onAbort, { once: true });
     }
-    let response;
     try {
-      response = await fetch(joinUrl(this.bridgeUrl, this.apiBase, operation), {
+      const response = await fetch(joinUrl(this.bridgeUrl, this.apiBase, operation), {
         method: 'POST',
         headers: this.headers(),
         body: JSON.stringify(payload),
         signal: controller.signal,
       });
+
+      // 计时器必须覆盖响应正文，不能只覆盖 fetch 拿到响应头之前。
+      const text = await response.text();
+      let data = null;
+      try {
+        data = text ? JSON.parse(text) : null;
+      } catch {
+        // 保留状态码，错误信息使用固定文案。
+      }
+      if (!response.ok) {
+        if (response.status === 403) {
+          throw new DafeiyuError('forbidden', '大肥鱼拒绝了这个来源：请检查桌宠的 arena_origins 和令牌配置。', {
+            status: 403,
+            retryable: false,
+          });
+        }
+        if (response.status === 401) {
+          throw new DafeiyuError('auth', '大肥鱼接入令牌不正确。', { status: 401, retryable: false });
+        }
+        if (response.status === 404) {
+          throw new DafeiyuError(
+            'unsupported',
+            '大肥鱼服务没有竞技场接口，请安装包含 arena_routes.py 的桌宠版本。',
+            { status: 404, retryable: false },
+          );
+        }
+        const upstreamMessage = typeof data?.error?.message === 'string'
+          ? data.error.message.slice(0, 300)
+          : '';
+        if (response.status >= 500) {
+          throw new DafeiyuError(
+            data?.error?.code ?? `http_${response.status}`,
+            `大肥鱼服务暂时不可用（HTTP ${response.status}）${upstreamMessage ? `：${upstreamMessage}` : '。'}`,
+            { status: response.status, retryable: true },
+          );
+        }
+        throw new DafeiyuError(
+          data?.error?.code ?? `http_${response.status}`,
+          upstreamMessage || `大肥鱼服务返回 HTTP ${response.status}。`,
+          { status: response.status, retryable: false },
+        );
+      }
+      if (!data || data.ok !== true) {
+        throw new DafeiyuError(
+          data?.error?.code ?? 'invalid_response',
+          data?.error?.message ?? '大肥鱼服务返回了无法识别的结果。',
+        );
+      }
+      return data;
     } catch (error) {
+      if (error instanceof DafeiyuError) throw error;
       if (timedOut) {
-        throw new DafeiyuError('timeout', `大肥鱼服务在 ${Math.round(timeoutMs / 1000)} 秒内没有响应。`);
+        throw new DafeiyuError('timeout', `大肥鱼服务在 ${Math.round(timeoutMs / 1000)} 秒内未完成响应。`);
       }
       if (cancelled) {
         throw new DafeiyuError('cancelled', '大肥鱼请求已取消。', { retryable: false });
@@ -83,53 +132,6 @@ export class DafeiyuClient {
       clearTimeout(timer);
       if (signal) signal.removeEventListener('abort', onAbort);
     }
-    const text = await response.text();
-    let data = null;
-    try {
-      data = text ? JSON.parse(text) : null;
-    } catch {
-      // 保留状态码，错误信息使用固定文案。
-    }
-    if (!response.ok) {
-      if (response.status === 403) {
-        throw new DafeiyuError('forbidden', '大肥鱼拒绝了这个来源：请检查桌宠的 arena_origins 和令牌配置。', {
-          status: 403,
-          retryable: false,
-        });
-      }
-      if (response.status === 401) {
-        throw new DafeiyuError('auth', '大肥鱼接入令牌不正确。', { status: 401, retryable: false });
-      }
-      if (response.status === 404) {
-        throw new DafeiyuError(
-          'unsupported',
-          '大肥鱼服务没有竞技场接口，请安装包含 arena_routes.py 的桌宠版本。',
-          { status: 404, retryable: false },
-        );
-      }
-      const upstreamMessage = typeof data?.error?.message === 'string'
-        ? data.error.message.slice(0, 300)
-        : '';
-      if (response.status >= 500) {
-        throw new DafeiyuError(
-          data?.error?.code ?? `http_${response.status}`,
-          `大肥鱼服务暂时不可用（HTTP ${response.status}）${upstreamMessage ? `：${upstreamMessage}` : '。'}`,
-          { status: response.status, retryable: true },
-        );
-      }
-      throw new DafeiyuError(
-        data?.error?.code ?? `http_${response.status}`,
-        upstreamMessage || `大肥鱼服务返回 HTTP ${response.status}。`,
-        { status: response.status, retryable: false },
-      );
-    }
-    if (!data || data.ok !== true) {
-      throw new DafeiyuError(
-        data?.error?.code ?? 'invalid_response',
-        data?.error?.message ?? '大肥鱼服务返回了无法识别的结果。',
-      );
-    }
-    return data;
   }
 
   connect({ matchId, client = 'AI Arena' } = {}) {
@@ -154,6 +156,10 @@ export class DafeiyuClient {
 
   speak({ sessionId, matchId, text, key }) {
     return this.#request('speak', { sessionId, matchId, text, key }, { timeoutMs: Math.min(this.timeoutMs, 20000) });
+  }
+
+  cancelSpeech({ sessionId, matchId }) {
+    return this.#request('speak-cancel', { sessionId, matchId }, { timeoutMs: 5000 });
   }
 
   leave({ sessionId, matchId }) {

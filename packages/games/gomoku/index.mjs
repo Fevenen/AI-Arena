@@ -80,6 +80,7 @@ function applyAction(state, seat, action) {
       type: 'win',
       winnerSeat: seat,
       winnerLabel: seatLabel(seat),
+      move: parsed.move,
       line: winning.cells,
       direction: winning.direction,
       length: winning.cells.length,
@@ -188,47 +189,49 @@ function describeForModel({ state, seatId, recentActions = [] }) {
   };
 }
 
+/**
+ * 严格结构化解析：只接受一个完整的 JSON 对象。
+ * 不再从自由文本中抓第一个坐标，避免“考虑 H8，但最终选 I8”被误判。
+ */
 function parseModelMove(content) {
   const text = String(content ?? '').trim();
   if (!text) return { ok: false, error: '模型返回了空内容。' };
-  let parsed = null;
-  const unfenced = text
-    .replace(/^```(?:json)?\s*/i, '')
-    .replace(/\s*```$/i, '')
-    .trim();
-  for (const candidate of [unfenced, text.slice(text.indexOf('{'), text.lastIndexOf('}') + 1)]) {
-    if (!candidate || !candidate.startsWith('{')) continue;
-    try {
-      parsed = JSON.parse(candidate);
-      break;
-    } catch {
-      // 尝试下一种提取方式。
-    }
+  let candidate = text;
+  const fenced = /^```(?:json)?\s*([\s\S]*?)\s*```$/i.exec(text);
+  if (fenced) {
+    candidate = fenced[1].trim();
+  } else if (text.includes('```')) {
+    return { ok: false, error: '输出包含不完整的 Markdown 代码围栏。' };
   }
-  let move = null;
-  let say = '';
-  if (parsed && typeof parsed === 'object') {
-    if (typeof parsed.move === 'string') move = parsed.move;
-    else if (parsed.action && typeof parsed.action.move === 'string') move = parsed.action.move;
-    if (typeof parsed.say === 'string') say = parsed.say.trim().slice(0, 120);
-    else if (typeof parsed.thought === 'string') say = parsed.thought.trim().slice(0, 120);
+  if (!candidate.startsWith('{') || !candidate.endsWith('}')) {
+    return { ok: false, error: '输出必须是单个完整 JSON 对象，不能包含解释文字。' };
   }
-  if (!move) {
-    const labeled = /["']?move["']?\s*[:=]\s*["']?([A-Za-z]\d{1,2})/.exec(text);
-    const bare = /\b([A-Oa-o]\d{1,2})\b/.exec(text);
-    move = labeled?.[1] ?? bare?.[1] ?? null;
+  let parsed;
+  try {
+    parsed = JSON.parse(candidate);
+  } catch {
+    return { ok: false, error: '输出 JSON 被截断或格式错误。' };
   }
-  if (!move) {
-    return { ok: false, error: '模型返回中没有可识别的 JSON move 字段。' };
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return { ok: false, error: '输出必须是单个 JSON 对象。' };
   }
-  const parsedCoordinate = parseCoordinate(move);
+  if (parsed.moves != null || parsed.actions != null) {
+    return { ok: false, error: '一次只能提交一个落子，不能返回动作数组。' };
+  }
+  if (typeof parsed.move !== 'string') {
+    return { ok: false, error: 'JSON 中缺少字符串类型的 move 字段。' };
+  }
+  if (parsed.say != null && typeof parsed.say !== 'string') {
+    return { ok: false, error: 'JSON 中的 say 必须是字符串。' };
+  }
+  const parsedCoordinate = parseCoordinate(parsed.move);
   if (!parsedCoordinate.ok) {
     return { ok: false, error: parsedCoordinate.message };
   }
   return {
     ok: true,
     action: { type: 'place', move: parsedCoordinate.move },
-    say,
+    say: String(parsed.say ?? '').trim().slice(0, 120),
   };
 }
 
@@ -297,6 +300,22 @@ function chooseBotAction({ state, seat, seed }) {
     return { type: 'place', move: pick.move };
   }
 
+  // 在普通棋形评分之前先识别“下一手有两个成五点”的双重威胁。
+  // 这类棋不需要多步搜索，却是固定局面里最容易被普通启发式忽略的一手。
+  const tactical = getTacticalHints({ state, seatId: seat });
+  if (tactical.doubleThreatMoves.length) {
+    const random = seededRandom(`${seed}:${state.moveCount}:double`);
+    const candidates = tactical.doubleThreatMoves
+      .map((move) => {
+        const col = 'ABCDEFGHIJKLMNO'.indexOf(move[0]);
+        const row = 15 - Number(move.slice(1));
+        const center = 14 - (Math.abs(row - 7) + Math.abs(col - 7));
+        return { move, score: center + random() * 4 };
+      })
+      .sort((a, b) => b.score - a.score);
+    return { type: 'place', move: candidates[0].move };
+  }
+
   const random = seededRandom(`${seed}:${state.moveCount}`);
   const scored = [];
   for (const candidate of empties) {
@@ -328,7 +347,61 @@ function chooseBotAction({ state, seat, seed }) {
   return { type: 'place', move: top[index].move };
 }
 
-function autoCommentCandidates({ previous, state, action, chat = [] }) {
+function getTacticalHints({ state, seatId }) {
+  if (state.outcome || state.turn !== seatId) {
+    return {
+      legalActions: [],
+      immediateWins: [],
+      mustBlocks: [],
+      doubleThreatMoves: [],
+      notes: ['当前不是该座位行动，或对局已经结束。'],
+    };
+  }
+  const board = state.board.map((row) => row.slice());
+  const opponent = opposite(seatId);
+  const empties = [];
+  for (let row = 0; row < SIZE; row += 1) {
+    for (let col = 0; col < SIZE; col += 1) {
+      if (board[row][col] == null) empties.push({ row, col, move: cellToCoord(row, col) });
+    }
+  }
+  const immediateWins = [];
+  const mustBlocks = [];
+  for (const cell of empties) {
+    if (wouldWin(board, cell.row, cell.col, seatId)) immediateWins.push(cell.move);
+    if (wouldWin(board, cell.row, cell.col, opponent)) mustBlocks.push(cell.move);
+  }
+  const doubleThreatMoves = [];
+  for (const cell of empties) {
+    if (immediateWins.includes(cell.move)) continue;
+    const copy = board.map((row) => row.slice());
+    copy[cell.row][cell.col] = seatId;
+    let wins = 0;
+    for (let row = 0; row < SIZE; row += 1) {
+      for (let col = 0; col < SIZE; col += 1) {
+        if (copy[row][col] == null && wouldWin(copy, row, col, seatId)) wins += 1;
+      }
+    }
+    if (wins >= 2) doubleThreatMoves.push(cell.move);
+  }
+  return {
+    legalActions: empties.map((cell) => ({ type: 'place', move: cell.move })),
+    immediateWins,
+    mustBlocks,
+    doubleThreatMoves: doubleThreatMoves.slice(0, 12),
+    notes: [
+      immediateWins.length ? `立即成五点：${immediateWins.join('、')}` : '当前没有立即成五点。',
+      mustBlocks.length ? `必须堵住的对方成五点：${mustBlocks.join('、')}` : '对方当前没有立即成五点。',
+      doubleThreatMoves.length ? `可能形成双威胁的落点：${doubleThreatMoves.slice(0, 12).join('、')}` : '未发现明显的双威胁落点。',
+    ],
+  };
+}
+
+function describeAction(action) {
+  return action?.move ? String(action.move) : JSON.stringify(action ?? {});
+}
+
+function autoCommentCandidates({ state, action }) {
   const events = [];
   if (state.outcome) {
     if (state.outcome.type === 'win') {
@@ -336,7 +409,15 @@ function autoCommentCandidates({ previous, state, action, chat = [] }) {
         key: `end:win:${state.outcome.winnerSeat}:${state.moveCount}`,
         type: 'game_end',
         priority: 100,
-        summary: `${seatLabel(action.seat)}以 ${action.move} 落子，连成 ${state.outcome.length} 子获胜。`,
+        summary: state.outcome.move
+          ? `${seatLabel(action.seat)}以 ${state.outcome.move} 落子，连成 ${state.outcome.length} 子获胜。`
+          : `${seatLabel(action.seat)}连成 ${state.outcome.length} 子获胜。`,
+        details: {
+          move: state.outcome.move ?? action?.action?.move ?? action?.move ?? null,
+          winnerSeat: state.outcome.winnerSeat,
+          line: state.outcome.line,
+          length: state.outcome.length,
+        },
       });
     } else {
       events.push({
@@ -388,20 +469,23 @@ export const gomokuGame = defineGamePlugin({
   maxPlayers: 2,
   supportsSpectator: true,
   seats: [
-    { id: 'black', name: '黑方', order: 1 },
-    { id: 'white', name: '白方', order: 2 },
+    { id: 'black', name: '黑方', shortName: '黑', color: 'black', order: 1 },
+    { id: 'white', name: '白方', shortName: '白', color: 'white', order: 2 },
   ],
   rulesText: RULES_TEXT,
   coordinateSystem: COORDINATE_SYSTEM,
   createInitialState,
   getPublicState,
   getSeatView: seatView,
+  getCurrentActor: (state) => state.turn,
   legalActions,
   validateAction: validationError,
   applyAction,
   getOutcome,
   describeForModel,
   parseModelMove,
+  describeAction,
+  getTacticalHints,
   chooseBotAction,
   autoCommentCandidates,
   // UI 需要的方向表，避免前端重复发明规则。

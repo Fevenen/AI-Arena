@@ -10,12 +10,14 @@ export async function createMockOpenAI(options = {}) {
     apiKey = null,
     delayMs = 0,
     responder = null,
+    bodyDelayMs = 0,
     modelId = `mock-${Date.now()}-${Math.random().toString(16).slice(2)}`,
   } = options;
   const state = {
     requests: [],
     responder,
     delayMs,
+    bodyDelayMs,
     failures: [],
   };
   const pending = new Set();
@@ -80,18 +82,29 @@ export async function createMockOpenAI(options = {}) {
       }
       if (typeof result === 'string') content = result;
     }
-    const keepOpen = pending.size;
+    const payload = JSON.stringify({
+      id: `chatcmpl-${state.requests.length}`,
+      object: 'chat.completion',
+      model,
+      choices: [{ index: 0, message: { role: 'assistant', content }, finish_reason: 'stop' }],
+      usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+    });
+    if (state.bodyDelayMs > 0) {
+      // 专门模拟：先发响应头，再延迟正文。
+      res.writeHead(200, {
+        'content-type': 'application/json',
+        'content-length': Buffer.byteLength(payload),
+      });
+      res.flushHeaders?.();
+      await new Promise((resolve) => setTimeout(resolve, state.bodyDelayMs));
+      if (!res.destroyed && !res.writableEnded) res.end(payload);
+      return;
+    }
     const timer = setTimeout(() => {
       pending.delete(timer);
       if (res.destroyed || res.writableEnded) return;
       res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({
-        id: `chatcmpl-${keepOpen}`,
-        object: 'chat.completion',
-        model,
-        choices: [{ index: 0, message: { role: 'assistant', content }, finish_reason: 'stop' }],
-        usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
-      }));
+      res.end(payload);
     }, 0);
     pending.add(timer);
   });
@@ -114,6 +127,9 @@ export async function createMockOpenAI(options = {}) {
     },
     setDelay(ms) {
       state.delayMs = ms;
+    },
+    setBodyDelay(ms) {
+      state.bodyDelayMs = ms;
     },
     pushFailure(failure) {
       state.failures.push(failure);

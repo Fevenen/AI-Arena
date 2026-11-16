@@ -1,8 +1,9 @@
 import { RuleError } from './errors.mjs';
 
 /**
- * 通用回放构建。只使用已接受动作和初始局面重建，不调用模型。
- * 未来游戏若有随机事件，应把随机种子写入 match.seed，并保证插件执行是确定性的。
+ * 旧版按步重建回放，保留给测试和第三方调用方。
+ * 当前 MatchService 优先使用每步保存的权威公开快照；新游戏应把随机结果写入
+ * match.randomEvents，使发牌/掷骰也可重放。
  */
 export function buildReplay({ game, match, limit = null }) {
   const actions = Array.isArray(match.actions) ? match.actions : [];

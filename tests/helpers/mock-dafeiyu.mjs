@@ -30,7 +30,10 @@ export async function createMockDafeiyu(options = {}) {
     sessions: new Map(),
     requests: [],
     commentDelayMs: options.commentDelayMs ?? 0,
+    questionDelayMs: options.questionDelayMs ?? 0,
     moveDelayMs: options.moveDelayMs ?? 0,
+    speechKeys: [],
+    speechCancelled: 0,
     commentText: options.commentText ?? ((event) => {
       if (event?.type === 'game_end') return '这局下完啦，主人辛苦，本鲸都看着呢。';
       if (event?.type === 'game_draw') return '满盘都没分出胜负，行吧，本鲸勉强陪你再来一局。';
@@ -39,6 +42,8 @@ export async function createMockDafeiyu(options = {}) {
     }),
     answerText: options.answerText ?? (() => '黑棋右边那条线有潜在威胁，先把要命的空点处理掉。'),
     moveResponder: options.moveResponder ?? null,
+    moveFailure: options.moveFailure ?? null,
+    commentFailure: options.commentFailure ?? null,
     speakStatus: options.speakStatus ?? 'queued',
     offlineCode: 503,
     personaName: '大肥鱼（模拟）',
@@ -113,6 +118,16 @@ export async function createMockDafeiyu(options = {}) {
     if (op === 'comment') {
       if (state.commentDelayMs) await new Promise((resolve) => setTimeout(resolve, state.commentDelayMs));
       if (res.destroyed) return;
+      if (state.commentFailure) {
+        send(state.commentFailure.status ?? 500, {
+          ok: false,
+          error: {
+            code: state.commentFailure.code ?? 'model_error',
+            message: state.commentFailure.message ?? 'mock comment failure',
+          },
+        });
+        return;
+      }
       const event = body.event;
       const text = typeof state.commentText === 'function'
         ? await state.commentText(event, body)
@@ -126,6 +141,8 @@ export async function createMockDafeiyu(options = {}) {
       return;
     }
     if (op === 'question') {
+      if (state.questionDelayMs) await new Promise((resolve) => setTimeout(resolve, state.questionDelayMs));
+      if (res.destroyed) return;
       const answer = typeof state.answerText === 'function'
         ? await state.answerText(body.question, body)
         : String(state.answerText ?? '');
@@ -135,6 +152,16 @@ export async function createMockDafeiyu(options = {}) {
     if (op === 'move') {
       if (state.moveDelayMs) await new Promise((resolve) => setTimeout(resolve, state.moveDelayMs));
       if (res.destroyed) return;
+      if (state.moveFailure) {
+        send(state.moveFailure.status ?? 500, {
+          ok: false,
+          error: {
+            code: state.moveFailure.code ?? 'model_error',
+            message: state.moveFailure.message ?? 'mock move failure',
+          },
+        });
+        return;
+      }
       let rawText;
       if (state.moveResponder) {
         rawText = await state.moveResponder(body, state);
@@ -147,7 +174,14 @@ export async function createMockDafeiyu(options = {}) {
       return;
     }
     if (op === 'speak') {
+      if (body.key) state.speechKeys.push(body.key);
       send(200, { ok: true, voiceStatus: state.speakStatus });
+      return;
+    }
+    if (op === 'speak-cancel') {
+      state.speechCancelled += state.speechKeys.length;
+      state.speechKeys = [];
+      send(200, { ok: true, cancelled: 1 });
       return;
     }
     if (op === 'leave') {
@@ -172,6 +206,12 @@ export async function createMockDafeiyu(options = {}) {
     },
     setOnline(value) {
       state.online = value;
+    },
+    setMoveFailure(value) {
+      state.moveFailure = value;
+    },
+    setCommentFailure(value) {
+      state.commentFailure = value;
     },
     async close() {
       await new Promise((resolve) => {

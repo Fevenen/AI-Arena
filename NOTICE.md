@@ -9,8 +9,8 @@
 
 可选协作项目：
 
-- **大肥鱼 (Dafeiyu)** 是独立维护的 Windows 桌宠项目，拥有自己的许可证、角色配置、模型配置和运行数据。竞技场不包含其素材或权重。双方只通过本机 HTTP 接口交换公开棋局信息。
-- 大肥鱼接入相关补丁位于该项目的源码仓库中，具体文件与责任边界见 `docs/dafeiyu.md`。
+- **大肥鱼 (Dafeiyu)** 是独立维护的 Windows 桌宠项目，拥有自己的 MIT 许可证、角色配置、模型配置和运行数据。竞技场不包含其素材或权重。双方只通过本机 HTTP 接口交换公开棋局信息。
+- 可选兼容补丁位于 `integrations/dafeiyu-v0.3.1-arena-bridge/`，其中大肥鱼桥文件派生自 Dafeiyu，版权归 Dafeiyu contributors，按 MIT 使用；具体文件、安装与联测边界见 `docs/dafeiyu.md` 和补丁目录 README。
 
 模型服务：
 

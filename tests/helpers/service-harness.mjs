@@ -27,6 +27,7 @@ export async function createServiceHarness({
   matchSettings = {},
   dafeiyuSettings = {},
   token = '',
+  gamePlugins = undefined,
 } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ai-arena-test-'));
   const template = JSON.parse(fs.readFileSync(path.join(PROJECT_ROOT, 'config', 'arena.example.json'), 'utf8'));
@@ -67,6 +68,7 @@ export async function createServiceHarness({
     logger,
     originProvider: () => 'http://127.0.0.1:8787',
     version: 'test',
+    ...(gamePlugins ? { gamePlugins } : {}),
   });
   const fakeViewers = new Map();
   function subscribe(matchId) {

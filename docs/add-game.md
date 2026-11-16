@@ -1,294 +1,237 @@
 # 添加桌游
 
-第一版正式游戏只有自由五子棋，但对局调度、座位、模型调用、持久化和回放都是围绕统一插件接口写的。新增游戏只需要提供规则插件；如果需要专属棋盘/桌面，再补一个网页组件。
+AI Arena 的平台层负责游戏库、座位、回合、AI 调度、模型提示、记录、可见性和回放。正式游戏仍然只有自由五子棋；`tests/fixtures/three-seat-game.mjs` 是一个**只用于开发/测试**的三座位插件，用来证明新增游戏不需要改大厅、对局调度、模型客户端或大肥鱼桥。
 
 ## 1. 插件放在哪里
 
 ```text
 packages/games/
-  index.mjs             唯一注册位置
+  index.mjs             正式游戏注册位置
   gomoku/
-    index.mjs           五子棋插件
-    rules.mjs           纯规则函数
+    index.mjs
+    rules.mjs
   <your-game>/
     index.mjs
     rules.mjs
+tests/fixtures/
+  three-seat-game.mjs   三座位测试插件（带私有目标）
 ```
 
-`packages/games/index.mjs`：
+正式注册：
 
 ```js
+// packages/games/index.mjs
 import gomokuGame from './gomoku/index.mjs';
 import yourGame from './your-game/index.mjs';
 
 export const GAME_PLUGINS = Object.freeze([gomokuGame, yourGame]);
 ```
 
-服务端和网页都通过注册表列表发现游戏；不要在 match-service 里增加游戏分支。
+测试或开发环境也可以不改注册表，在 `createArenaApp({ gamePlugins: [gomokuGame, testGame] })` 或 `MatchService({ gamePlugins })` 注入额外插件。网页从 `/api/games` 和 `/api/bootstrap.games` 读取列表，按插件声明自动生成游戏卡片和座位。
 
-## 2. 必须实现的接口
+## 2. 插件接口
 
-使用 `packages/core/game-api.mjs` 的 `defineGamePlugin` 包装插件，启动时会校验必要字段。
+用 `packages/core/game-api.mjs` 的 `defineGamePlugin` 包装。启动时会校验必要字段、座位 id 唯一性和人数。
 
 ```js
 import { defineGamePlugin } from '../../core/game-api.mjs';
 
 export default defineGamePlugin({
-  id: 'lowercase-id',                  // 只允许小写字母、数字、连字符
+  id: 'lowercase-id',                    // 小写字母/数字/连字符
   name: '中文游戏名',
   shortName: '短名',
   description: '一句话说明',
   rulesVersion: '1.0.0',
+
   minPlayers: 2,
-  maxPlayers: 2,
+  maxPlayers: 3,
   supportsSpectator: true,
   seats: [
-    { id: 'black', name: '黑方', order: 1 },
-    { id: 'white', name: '白方', order: 2 },
+    { id: 'sun', name: '金席', shortName: '金', color: 'gold', order: 1 },
+    { id: 'moon', name: '月席', shortName: '月', color: 'blue', order: 2 },
+    { id: 'star', name: '星席', shortName: '星', color: 'violet', order: 3 },
   ],
-  rulesText: '给模型看的规则正文',
-  coordinateSystem: { note: '给模型和网页看的动作格式说明' },
-  ui: { kind: 'custom', showCoordinates: false },
 
-  createInitialState({ seed }) { /* 返回可 JSON 序列化的状态 */ },
-  getPublicState(state) { /* 返回公开局面，绝不包含私有信息 */ },
-  getSeatView(state, seatId) { /* 该座位可见范围；可以加自己的手牌等 */ },
-  legalActions(state, seatId) { /* 可选；用于调试/未来辅助 */ },
+  rulesText: '给模型和玩家看的规则正文',
+  coordinateSystem: { note: '动作格式说明，可空' },
+  ui: { kind: 'custom', rows: 3, columns: 3, showCoordinates: false },
+
+  createInitialState({ seed }) { /* 可 JSON 序列化；随机/发牌用 seed 或 randomEvents */ },
+  getPublicState(state) { /* 绝不包含隐藏信息 */ },
+  getSeatView(state, seatId) { /* 该座位可见信息；可含自己的私有目标/手牌 */ },
+  getCurrentActor(state) { /* 返回当前行动座位 id，或 null */ },
+  legalActions(state, seatId) { /* 可选；规则辅助模式会展示 */ },
   validateAction(state, seatId, action) { /* 返回 {ok, action, code, message} */ },
-  applyAction(state, seatId, action) { /* 返回 {state, event}；不可变更新 */ },
+  applyAction(state, seatId, action) { /* 不可变更新，返回 {state, event} */ },
   getOutcome(state) { /* null 或 {type:'win'|'draw', winnerSeat, ...} */ },
-  describeForModel({ state, seatId, recentActions }) { /* 构造棋盘/局面文本 */ },
-  parseModelMove(text) { /* 返回 {ok, action, say} 或 {ok:false,error} */ },
+
+  describeForModel({ state, seatId, recentActions }) {
+    return {
+      gameName, rulesText, seatLabel,
+      boardText: '规范化局面文本',
+      lastMove,
+      responseFormat: '{"cell":5,"say":"可选"}',
+      // 可选：只给这个 AI 座位的私有上下文
+      privateContext: { /* 从 getSeatView 提取 */ },
+    };
+  },
+  parseModelMove(text) { /* 严格解析单个 JSON 动作 */ },
+  describeAction(action) { /* 给日志/聊天/终局引用，如“第 5 格” */ },
 
   // 可选
-  chooseBotAction({ state, seat, seed }) { /* 内置机器人策略 */ },
+  getTacticalHints({ state, seatId }) {
+    return {
+      legalActions: [],
+      immediateWins: [],
+      mustBlocks: [],
+      doubleThreatMoves: [],
+      notes: [],
+    };
+  },
+  chooseBotAction({ state, seat, seed }) { /* 内置机器人 */ },
   autoCommentCandidates({ previous, state, action, chat }) {
-    return []; // [{key,type,priority,summary,details}]
+    // action 是平台的动作记录：{ seat, action:{...}, ... }
+    return [{ key, type, priority, summary, details }];
   },
 });
 ```
 
-### 各字段的硬性要求
+## 3. 必须遵守的规则
 
-- **`id`**：稳定、不可随意改；历史记录会用它找插件。
-- **`rulesVersion`**：规则变化时递增；旧的 `match.rulesVersion` 与回放一起保存。
-- **`createInitialState`**：输入包含持久化的 `seed`。未来需要随机洗牌/掷骰时，用这个 seed 做确定性随机，保证回放可复现。
-- **`getPublicState`**：只返回公开信息。竞技场会把它发给观战者、网页和回放。
-- **`getSeatView`**：只返回该座位可见信息；大肥鱼棋手通过此视图获取局面。未来有私有手牌时不要放进 public view。
-- **`validateAction`**：必须自己检查是否轮到该座位、动作是否合法、是否终局。**不要信任模型或网页**。返回：
-  - 合法：`{ok:true, action:{...规范化动作...}}`
-  - 非法：`{ok:false, code:'wrong_turn', message:'现在轮到...'}`；`message` 会显示给用户并作为模型重试反馈。
-- **`applyAction`**：只在前端校验通过后由后端调用；仍要使用不可变更新（不要直接改旧 state），返回新的 state 与公开事件。
-- **`getOutcome`**：终局返回结果；`type:'win'` 时 `winnerSeat` 必须是座位 id；`type:'draw'` 表示和棋。不要返回 `winnerSeat` 给不存在的座位。
-- **`parseModelMove`**：模型返回 `{"move":"..."}` 等结构。建议容忍 Markdown 代码围栏，但只提取一个结构化动作；解析失败返回 `ok:false`，调度器会有限重试。
-- **`describeForModel`**：返回 `rulesText`、`boardText`/局面文本、`seatLabel`、`lastMove`、`responseFormat`。服务端会把它们放进模型提示。不要放隐藏信息或密钥。
-- **`autoCommentCandidates`**：可选。返回 `key` 要能区分同一事件；Arena 用它做去重和冷却。事件类型推荐：
-  - `threat`、`key_move`、`game_end`、`game_draw`。
-  - 高优先级事件 `game_end`/`game_draw` 会绕过普通点评冷却。
+### 座位与回合
 
-### 动作和可见性
+- `seats` 是完整座位表，不要求叫 black/white；平台按 `order` 生成配置。
+- `getCurrentActor(state)` 决定调度；没有它时才回退到 `state.turn`。
+- 平台目前最多支持一位真人、一个大肥鱼棋手，其余座位可混合模型和内置机器人。
+- `validateAction` 必须自己检查回合、动作格式、空位/可用资源与终局，不能信任模型或网页。
 
-当前动作、发言和事件都带 `visibility: "public"`。未来游戏可扩展为：
+### 公开视图与私有视图
 
-- `visibility: "seat:black"` / `"seat:white"` 的动作/事件；
-- 根记录中的 `privateBySeat`；
-- 根记录中的 `randomEvents`；
-- 初始状态里的 `seed`。
+- `getPublicState` 会进入：网页、SSE、公开 API、导出、回放公开快照。
+- `getSeatView` 只给该座位模型的提示和大肥鱼棋手快照。
+- 私有字段不要放进 public view；测试插件用 `SUN-SECRET-TARGET` 等标记验证公开 API/SSE/导出不泄露。
+- 平台不会把原始 `match.state` 直接返回给网页；即使插件状态里有私有信息，出口只调用这两个函数。
 
-回放重建时只使用 `seed + 已接受动作`；服务端不会重放模型。未来需要发牌/掷骰时，必须把随机结果持久化或保证 seed 驱动的确定性。
+### 结构化动作与两种模式
 
-## 3. 最小可用示例：取石子
+- `parseModelMove` 必须拒绝自由文本、含糊、多动作、截断和非法动作；返回 `ok:false` 会让调度器有限重试，耗尽后暂停。
+- `responseFormat` 是给模型的必填格式说明。
+- **纯模型**只拿到规则、公开局面/座位可见信息和格式；平台不注入合法候选或战术提示。
+- **规则辅助**额外把 `legalActions` 和 `getTacticalHints` 的结果交给模型；插件应尽量提供可验证的立即胜负点/必堵点。
+- 大肥鱼棋手沿用同一套 snapshot；桥不写死黑色/白色。
 
-下面是一个完整可运行的插件，用来演示接口。它**未注册到本项目**，复制到 `packages/games/stones/index.mjs` 并测试后才能在开桌页出现。
+### 终局与 UI
 
-规则：9 颗石子，双方轮流取 1–2 颗，取到最后一颗者胜。
+- `getOutcome` 返回 `winnerSeat` 必须是存在的座位 id；和棋用 `{type:'draw'}`。
+- 建议在 outcome 中同时写真实最后一手字段（例如 `move` 或 `cell`），终局点评和 UI 会引用它，避免 undefined。
+- `applyAction` 的 `event` 是公开事件；事件的私有信息会由平台过滤，插件仍不要把隐藏状态放进去。
+- `describeAction` 用于最后一手、回放和逐手指标；不要使用 `JSON.stringify` 作为唯一展示。
+
+### 回放与随机
+
+平台在每一步后保存权威公开快照和每个座位视图，回放默认不再调用 `applyAction`，所以旧插件版本变化后仍能打开有快照的旧局。
+
+- 新对局从第 0 步开始保存快照。
+- 旧记录若没有快照，平台仅在 `match.rulesVersion === game.rulesVersion` 时补建；不同版本且无快照会明确报错。
+- 未来发牌/掷骰：把公开随机结果写进 `match.randomEvents`，或把随机结果纳入插件状态；平台快照会保留 `seed` 与 `randomEvents`。
+- 已有棋谱的 `rulesVersion` 不要随意修改；规则变化时递增版本。
+
+## 4. 测试插件：三座位
+
+`tests/fixtures/three-seat-game.mjs` 是一个最小但完整的示例：
+
+- 三个座位 `sun/moon/star`，顺序 `金→月→星`；
+- 3×3 桌面，三连获胜；
+- 九格占满时由**私有目标格**决定唯一赢家；
+- `getPublicState` 隐藏目标，`getSeatView` 显示自己的目标和提示；
+- 有 `getCurrentActor`、合法动作、结算、严格 JSON 解析、内置机器人、专属网页组件（`GAME_SURFACES['three-seat-test']`）。
+
+测试中：
 
 ```js
-import { defineGamePlugin } from '../../core/game-api.mjs';
+const games = [gomokuGame, threeSeatGame];
+const app = await createArenaApp({ configPath, gamePlugins: games });
+```
 
-const RULES = '桌面有 9 颗石子。黑方先手。每回合可取 1 颗或 2 颗。取到最后一颗石子的一方获胜。';
-const LABEL = { black: '黑方', white: '白方' };
+或：
 
-function applyAction(state, seat, action) {
-  const check = validateAction(state, seat, action);
-  if (!check.ok) throw Object.assign(new Error(check.message), check);
-  const stones = state.stones - action.take;
-  const ended = stones === 0;
-  return {
-    state: {
-      ...state,
-      stones,
-      turn: ended ? null : seat === 'black' ? 'white' : 'black',
-      lastAction: { seat, take: action.take },
-      outcome: ended
-        ? { type: 'win', winnerSeat: seat, winnerLabel: LABEL[seat] }
-        : null,
-    },
-    event: { type: 'take', seat, take: action.take, stonesLeft: stones },
-  };
-}
-
-function validateAction(state, seat, action) {
-  if (state.outcome) return { ok: false, code: 'game_over', message: '对局已经结束。' };
-  if (!['black', 'white'].includes(seat)) return { ok: false, code: 'unknown_seat', message: '未知座位。' };
-  if (state.turn !== seat) return { ok: false, code: 'wrong_turn', message: `现在轮到${LABEL[state.turn]}。` };
-  const take = Number(action?.take);
-  if (![1, 2].includes(take)) return { ok: false, code: 'invalid_take', message: '只能取 1 或 2 颗石子。' };
-  if (take > state.stones) return { ok: false, code: 'not_enough', message: '剩下的石子不够。' };
-  return { ok: true, action: { take } };
-}
-
-const game = defineGamePlugin({
-  id: 'stones',
-  name: '取石子',
-  shortName: '石子',
-  description: '9 颗石子，轮流取 1–2 颗，取最后一颗者胜。',
-  rulesVersion: '1.0.0',
-  minPlayers: 2,
-  maxPlayers: 2,
-  supportsSpectator: true,
-  seats: [
-    { id: 'black', name: '黑方', order: 1 },
-    { id: 'white', name: '白方', order: 2 },
-  ],
-  rulesText: RULES,
-  coordinateSystem: { format: '{"take":1}' },
-  ui: { kind: 'custom' },
-  createInitialState() {
-    return { stones: 9, turn: 'black', outcome: null, lastAction: null };
-  },
-  getPublicState(state) {
-    return {
-      gameId: 'stones', stones: state.stones, turn: state.turn,
-      outcome: state.outcome, lastAction: state.lastAction,
-    };
-  },
-  getSeatView(state, seatId) {
-    return { ...this.getPublicState(state), yourSeat: seatId };
-  },
-  legalActions(state, seatId) {
-    if (state.outcome || state.turn !== seatId) return [];
-    return [1, 2].filter((take) => take <= state.stones).map((take) => ({ take }));
-  },
-  validateAction,
-  applyAction,
-  getOutcome(state) { return state.outcome; },
-  describeForModel({ state, seatId }) {
-    return {
-      gameName: '取石子',
-      rulesText: RULES,
-      seatId,
-      seatLabel: LABEL[seatId],
-      boardText: `剩余 ${state.stones} 颗石子，当前轮到${LABEL[state.turn]}。`,
-      lastMove: state.lastAction,
-      responseFormat: '{"take":1,"say":"可选公开想法"}',
-    };
-  },
-  parseModelMove(text) {
-    const source = String(text ?? '');
-    const match = /"take"\s*:\s*([12])/.exec(source);
-    const take = Number(match?.[1] ?? NaN);
-    if (![1, 2].includes(take)) return { ok: false, error: '缺少 take=1 或 2。' };
-    const say = /"say"\s*:\s*"([^"]*)"/.exec(source)?.[1] ?? '';
-    return { ok: true, action: { take }, say: say.slice(0, 120) };
-  },
-  chooseBotAction({ state }) {
-    // 简单策略：能取完就取完，否则尽量给对方留 3 的倍数（演示用）。
-    if (state.stones <= 2) return { take: state.stones };
-    return { take: state.stones % 3 === 0 ? 2 : 1 };
-  },
-  autoCommentCandidates({ state, action }) {
-    if (!state.outcome) {
-      return [{ key: `stones:${state.stones}`, type: 'key_move', priority: 50, summary: `还剩 ${state.stones} 颗石子。` }];
-    }
-    return [{ key: `stones:end:${action.seat}`, type: 'game_end', priority: 100, summary: `${LABEL[action.seat]}取走最后一颗。` }];
-  },
+```js
+const harness = await createServiceHarness({ gamePlugins: games });
+const match = await harness.service.createMatch({
+  gameId: 'three-seat-test',
+  seats: { sun: { kind: 'bot' }, moon: { kind: 'bot' }, star: { kind: 'bot' } },
+  dafeiyu: { enabled: false },
 });
-
-export default game;
 ```
 
-### 注册
+测试覆盖：
 
-```js
-// packages/games/index.mjs
-import stonesGame from './stones/index.mjs';
-export const GAME_PLUGINS = Object.freeze([gomokuGame, stonesGame]);
-```
+- 游戏库/API 出现三席游戏；
+- 逐座位行动和终局；
+- 公开 API、SSE、导出、回放都不含私有目标；
+- 模型提示包含自己的私有目标、不包含其他座位目标；
+- 规则版本变化后旧局仍用快照回放；
+- 私有目标结算。
 
-注册后重启服务。
+正式发布默认只注册五子棋；不要把测试插件加进 `GAME_PLUGINS`。
 
-### 专属网页组件
+## 5. 专属网页组件
 
-第一版网页在 `apps/web/app.js` 里有一个 `GAME_SURFACES` 注册表：
+网页的 `GAME_SURFACES` 注册表按 `gameId` 选择桌面组件：
 
 ```js
 const GAME_SURFACES = {
   gomoku: (ctx) => boardCard(ctx),
-  stones: ({ match, view, interactive }) => renderStonesTable({ match, view, interactive }),
+  'your-game': ({ match, view, interactive, humanColor }) => yourSurface({
+    match, view, interactive, humanColor,
+  }),
 };
 ```
 
-组件接收：
+组件收到：
 
-- `match`：公开对局、座位、聊天、状态；
+- `match`：公开对局、座位、聊天、状态、逐手动作；
 - `view`：当前 `getPublicState` 结果；
-- `interactive`：该真人当前是否可操作；
-- `humanColor`：人类座位 id（如适用）；
+- `interactive`：真人是否可操作；
+- `humanColor`：人类座位 id（通用命名，实际可为任意 id）；
 - `title`。
 
-组件返回 DOM 字符串。交互动作可以复用网页已有的 `api()` 提交到：
+交互动作提交到：
 
 ```text
 POST /api/matches/:id/actions
-{ "seat": "black", "action": { "take": 1 }, "clientActionId": "..." }
+{ "seat": "sun", "action": { "cell": 5 }, "clientActionId": "..." }
 ```
 
-如果不加组件，历史仍可打开，网页会显示只读的通用局面摘要；新游戏可能无法在棋盘上交互，因此正式发布前应补组件。
+没有专属组件时，网页显示只读的通用局面摘要；历史仍可打开，但新游戏可能无法交互。测试插件展示了 `data-action="play-cell"` 的简单实现。
 
-## 4. 测试与验收
+## 6. 测试清单
 
-### 必测项
+为新游戏新增 `tests/<game>.test.mjs`，至少覆盖：
 
-为插件新增 `tests/<game>.test.mjs`，覆盖：
+1. 初始状态、座位顺序和当前行动者；
+2. 合法/非法动作、错误座位、错误回合；
+3. 终局、和棋与不允许继续；
+4. 不可变状态和重复动作幂等；
+5. 严格模型解析：合法 JSON、代码围栏、歧义、多动作、截断、非法值；
+6. public view 不含私有字段，seat view 只含自己的私有字段；
+7. 规则辅助提示（如果提供）与内置机器人合法；
+8. `rulesVersion` 变化后仍能用快照回放；
+9. 专属网页组件或通用 fallback 可打开；
+10. 导出不含 Key 和私有状态。
 
-1. 初始状态与先手；
-2. 合法动作、非法动作、错误座位、错误回合；
-3. 终局条件与和棋/平局条件；
-4. 终局后拒绝继续行动；
-5. 同一动作重复提交不改变结果；
-6. 状态不可变；
-7. 模型动作解析器：合法结构、代码围栏、非法内容；
-8. `getPublicState` 不含私有字段；
-9. 终局判断与胜者座位；
-10. 若提供机器人/自动点评，覆盖去重 key。
-
-运行：
+启动并运行全部：
 
 ```powershell
 node --test --test-concurrency=1
 ```
 
-### 端到端验收
+浏览器验收（自动启动隔离服务）：
 
-在真实网页中：
+```powershell
+node scripts/ui-smoke.mjs
+```
 
-1. 开桌页出现新游戏；
-2. 真人与内置机器人能完成一局并产生结果；
-3. 两个 AI 座位能自动完成一局；
-4. 模型返回非法动作会暂停而不是改棋盘；
-5. 对局结束、重启服务后仍可在历史中打开；
-6. 回放能逐手、跳步，并同步当时的公开发言；
-7. 导出记录中没有模型 Key、私有信息不越权显示；
-8. 大肥鱼若启用，能收到该游戏的公开快照，或明确得到“不支持/自定义组件”的提示。
+## 7. 不要修改的地方
 
-### 交给其他执行 AI 的说明
-
-可以把本文、`packages/core/game-api.mjs`、`packages/games/gomoku/` 和一份规则/动作/计分/胜负示例一起交给执行 AI。要求它：
-
-- 不修改 `match-service.mjs`；
-- 只新增插件、注册、测试，以及必要时的网页组件；
-- 按上面的验收清单逐项跑命令并报告结果；
-- 规则版本、动作格式和胜负条件必须由测试固定。
-
-网页粘贴规则自动生成游戏是后续功能，本期不实现。
+新增游戏时**不要**在 `match-service.mjs`、`match-store.mjs`、`app.mjs` 中增加游戏分支；也不要硬编码 black/white 或某个坐标。若接口确实不足，先改核心接口并在本文更新契约，再改插件和测试。

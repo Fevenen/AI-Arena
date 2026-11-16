@@ -178,7 +178,7 @@ test('满盘且无五连时和棋', () => {
   assert.equal(boardAsText(applied.state.board).split('\n').length, SIZE + 1);
 });
 
-test('模型 JSON 解析宽容但会校验非法坐标', () => {
+test('模型落子只接受单个完整 JSON；歧义、截断、多动作和自由文本都拒绝', () => {
   assert.deepEqual(gomokuGame.parseModelMove('{"move":"h8","say":"我先占中间。"}'), {
     ok: true,
     action: { type: 'place', move: 'H8' },
@@ -188,11 +188,12 @@ test('模型 JSON 解析宽容但会校验非法坐标', () => {
     gomokuGame.parseModelMove('```json\n{"move":"A1"}\n```').action.move,
     'A1',
   );
-  assert.deepEqual(gomokuGame.parseModelMove('我觉得下这里：{"move":"O15"} 比较好'), {
-    ok: true,
-    action: { type: 'place', move: 'O15' },
-    say: '',
-  });
+  // 不能从“考虑 H8，但最终选 I8”里猜第一个坐标。
+  assert.equal(gomokuGame.parseModelMove('考虑 H8，但最终选 I8').ok, false);
+  assert.equal(gomokuGame.parseModelMove('我觉得下这里：{"move":"O15"} 比较好').ok, false);
+  assert.equal(gomokuGame.parseModelMove('{"move":"H8","moves":["I8"]}').ok, false);
+  assert.equal(gomokuGame.parseModelMove('{"move":"H8"').ok, false);
+  assert.equal(gomokuGame.parseModelMove('```json\n{"move":"H8"}\n额外解释').ok, false);
   assert.equal(gomokuGame.parseModelMove('{"move":"Z99"}').ok, false);
   assert.equal(gomokuGame.parseModelMove('我不想下').ok, false);
   assert.equal(gomokuGame.parseModelMove('{"move":"H8","say":"' + '长'.repeat(300) + '"}').say.length, 120);
@@ -208,8 +209,44 @@ test('关键事件包含成五威胁和终局，且 key 可去重', () => {
     gomokuGame,
     alternating(['A1', 'B1', 'C1', 'D1', 'E1'], ['A15', 'C15', 'E15', 'G15', 'I15']),
   );
-  const end = gomokuGame.autoCommentCandidates({ state: gameOver, action: { seat: 'black', move: 'E1' } });
+  const end = gomokuGame.autoCommentCandidates({
+    state: gameOver,
+    action: { seat: 'black', action: { move: 'E1' } },
+  });
   assert.equal(end.length, 1);
   assert.equal(end[0].type, 'game_end');
   assert.equal(end[0].priority, 100);
+  assert.equal(end[0].details.move, 'E1');
+  assert.match(end[0].summary, /E1/);
+  assert.doesNotMatch(end[0].summary, /undefined/);
+});
+
+test('长连终局点评引用真实最后一手，不出现 undefined', () => {
+  const longWin = play(gomokuGame, [
+    'black:A1', 'white:A15', 'black:B1', 'white:C15', 'black:C1',
+    'white:E15', 'black:E1', 'white:G15', 'black:F1', 'white:I15', 'black:D1',
+  ]);
+  assert.equal(longWin.outcome.type, 'win');
+  assert.equal(longWin.outcome.length, 6);
+  assert.equal(longWin.outcome.move, 'D1');
+  const end = gomokuGame.autoCommentCandidates({
+    state: longWin,
+    action: { seat: 'black', action: { move: 'D1' } },
+  });
+  assert.equal(end[0].type, 'game_end');
+  assert.equal(end[0].details.move, 'D1');
+  assert.match(end[0].summary, /D1/);
+  assert.match(end[0].summary, /6 子/);
+  assert.doesNotMatch(JSON.stringify(end), /undefined/);
+});
+
+test('规则辅助提供合法候选、立即成五和必堵点', () => {
+  // 黑方 A1-D1 四连，白方 O15/O13/O11 三子无威胁。
+  const blackToMove = play(gomokuGame, ['black:A1', 'white:O15', 'black:B1', 'white:O13', 'black:C1', 'white:O11', 'black:D1', 'white:M15']);
+  const hints = gomokuGame.getTacticalHints({ state: blackToMove, seatId: 'black' });
+  assert.ok(hints.legalActions.length > 0);
+  assert.ok(hints.immediateWins.includes('E1'));
+  const whiteToMove = play(gomokuGame, ['black:A1', 'white:O15', 'black:B1', 'white:O13', 'black:C1', 'white:O11', 'black:D1']);
+  const whiteHints = gomokuGame.getTacticalHints({ state: whiteToMove, seatId: 'white' });
+  assert.ok(whiteHints.mustBlocks.includes('E1'));
 });

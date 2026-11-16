@@ -15,10 +15,11 @@ import {
   isLoopbackHostname,
 } from './http-utils.mjs';
 import { listProviders, testModelConnection, validateModelConfig } from '../../packages/models/index.mjs';
+import { GAME_PLUGINS } from '../../packages/games/index.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const WEB_ROOT = path.resolve(HERE, '..', 'web');
-export const VERSION = '0.1.0';
+export const VERSION = '0.2.0';
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -90,6 +91,7 @@ export async function createArenaApp({
   clientFactory = undefined,
   logger = console,
   autoStart = false,
+  gamePlugins = GAME_PLUGINS,
 } = {}) {
   const configStore = new ConfigStore({ configPath });
   const hub = new EventHub({ heartbeatMs: configStore.matchSettings.sseHeartbeatMs });
@@ -101,6 +103,7 @@ export async function createArenaApp({
     hub,
     logger,
     clientFactory,
+    gamePlugins,
     originProvider: () => publicUrl.replace(/\/$/, ''),
     version: VERSION,
   });
@@ -290,6 +293,10 @@ export async function createArenaApp({
       sendJson(res, 200, { ok: true });
       return;
     }
+    if (method === 'GET' && pathname === '/api/games') {
+      sendJson(res, 200, { games: matchService.games });
+      return;
+    }
     if (method === 'GET' && pathname === '/api/dafeiyu/config') {
       sendJson(res, 200, { dafeiyu: configStore.publicDafeiyuSettings() });
       return;
@@ -310,6 +317,7 @@ export async function createArenaApp({
         player: url.searchParams.get('player') ?? '',
         result: url.searchParams.get('result') ?? '',
         status: url.searchParams.get('status') ?? '',
+        game: url.searchParams.get('game') ?? '',
         q: url.searchParams.get('q') ?? '',
       };
       sendJson(res, 200, {
@@ -442,6 +450,19 @@ export async function createArenaApp({
     if (disconnectRoute) {
       const [id] = disconnectRoute;
       const match = await matchService.disconnectDafeiyu(id);
+      sendJson(res, 200, { match });
+      return;
+    }
+    const leaveRoute = method === 'POST' && matchRoute(pathname, /^\/api\/matches\/([^/]+)\/leave$/);
+    if (leaveRoute) {
+      const [id] = leaveRoute;
+      let body = {};
+      try {
+        body = await readJson(req);
+      } catch {
+        body = {};
+      }
+      const match = await matchService.leaveMatch(id, { reason: body.reason });
       sendJson(res, 200, { match });
       return;
     }

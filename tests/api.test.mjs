@@ -7,8 +7,15 @@ import { createArenaApp, VERSION } from '../apps/server/app.mjs';
 import { PROJECT_ROOT } from '../apps/server/config-store.mjs';
 import { createMockOpenAI } from './helpers/mock-openai.mjs';
 import { createMockDafeiyu } from './helpers/mock-dafeiyu.mjs';
+import { gomokuGame } from '../packages/games/gomoku/index.mjs';
+import { threeSeatGame } from './fixtures/three-seat-game.mjs';
 
-async function startApp({ models = [], dafeiyuUrl = 'http://127.0.0.1:1', matchSettings = {} } = {}) {
+async function startApp({
+  models = [],
+  dafeiyuUrl = 'http://127.0.0.1:1',
+  matchSettings = {},
+  gamePlugins = undefined,
+} = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ai-arena-api-'));
   const template = JSON.parse(fs.readFileSync(path.join(PROJECT_ROOT, 'config', 'arena.example.json'), 'utf8'));
   const config = {
@@ -36,6 +43,7 @@ async function startApp({ models = [], dafeiyuUrl = 'http://127.0.0.1:1', matchS
   const app = await createArenaApp({
     configPath,
     logger: { info() {}, warn() {}, error() {} },
+    ...(gamePlugins ? { gamePlugins } : {}),
   });
   await app.start({ port: 0, host: '127.0.0.1' });
   return {
@@ -255,7 +263,7 @@ test('HTTP 对局流程：落子、SSE、暂停/继续、历史、结束与导�
       return state.data.match.status === 'finished';
     }, 12000, '全 AI 对局未结束');
     const finished = await api(env.base, `/api/matches/${secondId}`);
-    assert.ok(finished.data.match.result === 'black_win' || finished.data.match.result === 'white_win' || finished.data.match.result === 'draw');
+    assert.ok(['win', 'draw', 'black_win', 'white_win'].includes(finished.data.match.result));
     const history = await api(env.base, '/api/matches?status=finished');
     assert.ok(history.data.matches.some((item) => item.id === secondId));
     const historyPlayer = await api(env.base, '/api/matches?player=' + encodeURIComponent('内置机器人'));
@@ -292,6 +300,80 @@ test('HTTP 对局流程：落子、SSE、暂停/继续、历史、结束与导�
   } finally {
     abort?.abort();
     if (fs.existsSync(env.configPath)) await env.close();
+  }
+});
+
+test('API 游戏库可从注入注册表列出第二款游戏，SSE/导出不泄露私有状态', async () => {
+  const env = await startApp({ gamePlugins: [gomokuGame, threeSeatGame] });
+  try {
+    const games = await api(env.base, '/api/games');
+    assert.equal(games.status, 200);
+    assert.deepEqual(games.data.games.map((game) => game.id), ['gomoku', 'three-seat-test']);
+    const bootstrap = await api(env.base, '/api/bootstrap');
+    assert.deepEqual(bootstrap.data.games.map((game) => game.id), ['gomoku', 'three-seat-test']);
+    const created = await api(env.base, '/api/matches', {
+      method: 'POST',
+      body: {
+        gameId: 'three-seat-test',
+        seats: {
+          sun: { kind: 'bot' },
+          moon: { kind: 'bot' },
+          star: { kind: 'bot' },
+        },
+        dafeiyu: { enabled: false },
+      },
+    });
+    assert.equal(created.status, 201);
+    const id = created.data.match.id;
+    await waitFor(async () => (await api(env.base, `/api/matches/${id}`)).data.match.status === 'finished', 10000, '三席 API 对局未结束');
+    const publicText = (await api(env.base, `/api/matches/${id}`)).text;
+    assert.doesNotMatch(publicText, /SUN-SECRET|MOON-SECRET|STAR-SECRET|privateTargets|secretNote/);
+    const exported = (await api(env.base, `/api/matches/${id}/export`)).text;
+    assert.doesNotMatch(exported, /SUN-SECRET|MOON-SECRET|STAR-SECRET|privateTargets|secretNote/);
+
+    const controller = new AbortController();
+    const response = await fetch(`${env.base}/api/matches/${id}/events`, { signal: controller.signal });
+    assert.equal(response.status, 200);
+    const reader = response.body.getReader();
+    const first = await reader.read();
+    controller.abort();
+    const sseText = new TextDecoder().decode(first.value ?? new Uint8Array());
+    assert.match(sseText, /event: match/);
+    assert.doesNotMatch(sseText, /SUN-SECRET|MOON-SECRET|STAR-SECRET|privateTargets|secretNote/);
+  } finally {
+    await env.close();
+  }
+});
+
+test('离开对局 API 暂停棋手局并释放大肥鱼会话', async () => {
+  const pet = await createMockDafeiyu();
+  const env = await startApp({ dafeiyuUrl: pet.url });
+  try {
+    const created = await api(env.base, '/api/matches', {
+      method: 'POST',
+      body: {
+        gameId: 'gomoku',
+        seats: {
+          black: { kind: 'human' },
+          white: { kind: 'dafeiyu', moveMode: 'assisted' },
+        },
+        dafeiyu: { enabled: true, autoComment: false, voice: false },
+      },
+    });
+    const id = created.data.match.id;
+    await waitFor(async () => (await api(env.base, `/api/matches/${id}`)).data.match.dafeiyu.status === 'connected', 5000, '大肥鱼未连接');
+    const left = await api(env.base, `/api/matches/${id}/leave`, {
+      method: 'POST',
+      body: { reason: 'API 测试离开' },
+    });
+    assert.equal(left.status, 200);
+    assert.equal(left.data.match.status, 'paused');
+    assert.equal(left.data.match.pause.code, 'page_left');
+    assert.equal(left.data.match.dafeiyu.status, 'disconnected');
+    await waitFor(() => pet.state.sessions.size === 0, 3000, '会话没有释放');
+  } finally {
+    await env.close();
+    await pet.close();
   }
 });
 
