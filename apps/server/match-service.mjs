@@ -1,3 +1,4 @@
+import { describeReasoning } from '../../packages/models/reasoning.mjs';
 import {
   ArenaError,
   createId,
@@ -23,6 +24,15 @@ const KIND_LABELS = {
 };
 
 const AUTO_PRIORITY = new Set(['game_end', 'game_draw']);
+const FAST_MOVE_MS = 25000;
+const gameUsesHiddenState = (match, games) => games.get(match.gameId)?.hiddenShuffle === true;
+const resultStreamAllowed = config => ['deepseek','qwen','kvmem'].includes(describeReasoning(config).adapter);
+const MAX_MODEL_MOVE_TOKENS = 131072;
+const CONFIGURED_MODEL_MOVE_TOKENS = Number.parseInt(process.env.ARENA_MODEL_MOVE_TOKENS ?? '', 10);
+const MODEL_MOVE_TOKENS = Number.isInteger(CONFIGURED_MODEL_MOVE_TOKENS)
+  ? Math.min(MAX_MODEL_MOVE_TOKENS, Math.max(256, CONFIGURED_MODEL_MOVE_TOKENS))
+  : 16384;
+const VIEWER_RECONNECT_GRACE_MS = 4500;
 
 function nowIso() {
   return new Date().toISOString();
@@ -83,12 +93,18 @@ function publicModelSnapshot(model) {
     baseUrl: model.baseUrl,
     timeoutMs: model.timeoutMs,
     maxRetries: model.maxRetries,
+    reasoningEffort: model.reasoningEffort ?? 'default',
+    reasoningAdapter: model.reasoningAdapter ?? 'auto',
+    thinkingMode: model.thinkingMode ?? 'default',
+    reasoning: describeReasoning(model),
+    maxOutputTokens: model.maxOutputTokens ?? 4800,
   };
 }
 
 export class MatchService {
   constructor({
     configStore,
+    monitor = null,
     store,
     hub,
     logger = console,
@@ -98,6 +114,7 @@ export class MatchService {
     gamePlugins = GAME_PLUGINS,
   }) {
     this.configStore = configStore;
+    this.monitor = monitor;
     this.store = store;
     this.hub = hub;
     this.logger = logger;
@@ -221,7 +238,7 @@ export class MatchService {
       return false;
     }
     try {
-      let state = game.createInitialState({ seed: match.seed });
+      let state = game.createInitialState({ seed: match.seed, seatIds: match.seatOrder });
       const snapshots = [{
         step: 0,
         at: match.createdAt ?? nowIso(),
@@ -254,6 +271,7 @@ export class MatchService {
       pending: null,
       stepOnce: false,
       scheduleTimer: null,
+      viewerReleaseTimer: null,
       modelConfigs: {},
       dafeiyu: null,
       dafeiyuBusy: false,
@@ -337,6 +355,7 @@ export class MatchService {
       gameName: match.gameName,
       rulesVersion: match.rulesVersion,
       modeLabel: match.modeLabel,
+      aiPace: match.aiPace ?? 'quality',
       createdAt: match.createdAt,
       startedAt: match.startedAt,
       finishedAt: match.finishedAt,
@@ -378,7 +397,7 @@ export class MatchService {
         name: game.name,
         rulesVersion: game.rulesVersion,
         rulesText: game.rulesText,
-        seats: seatByOrder(game).map((seat) => ({
+        seats: seatByOrder(game).filter(seat => match.seats[seat.id]).map((seat) => ({
           id: seat.id,
           name: seat.name,
           shortName: seat.shortName ?? seat.name.slice(0, 1),
@@ -393,6 +412,33 @@ export class MatchService {
       recovered: Boolean(match.recovered),
       archived: Boolean(runtime?.archived),
     };
+  }
+
+  desktopCompanion() {
+    const match = [...this.matches.values()].reverse().find(item => item.dafeiyu?.enabled
+      && this.hub.count(item.id) > 0 && !this._runtime(item.id)?.archived
+      && ['playing', 'paused', 'finished'].includes(item.status)
+      && (item.status !== 'finished' || item.dafeiyu.status === 'connected'));
+    if (!match) return { active: false };
+    const view = this.publicMatch(match);
+    const seat = view.dafeiyu.playerSeat;
+    return {
+      active: true, matchId: match.id, gameName: match.gameName, matchStatus: match.status,
+      role: seat ? 'player' : 'observer', seatName: seat ? this._seatLabel(match, seat) : null,
+      turn: view.turnSeatName, connection: view.dafeiyu.status,
+      auto: view.dafeiyu.autoComment, voice: view.dafeiyu.voice,
+      canAsk: view.dafeiyu.status === 'connected' && !view.dafeiyu.askBlockedReason,
+      askBlockedReason: view.dafeiyu.askBlockedReason,
+      chat: view.chat.filter(item => ['comment','question','answer','move'].includes(item.kind)).slice(-12),
+    };
+  }
+
+  humanView(id) {
+    const match = this._getMatch(id);
+    const game = this._gameFor(match);
+    const seat = Object.values(match.seats).find(item => item.kind === 'human')?.id;
+    if (!game?.hiddenShuffle || !seat || !['playing', 'paused'].includes(match.status)) return null;
+    return { seat, step: match.actions.length, state: game.getSeatView(match.state, seat) };
   }
 
   _hasDafeiyuSeat(match) {
@@ -435,7 +481,8 @@ export class MatchService {
         && Boolean(runtime)
         && !runtime.archived,
       canRetry: paused
-        && ['model_error', 'model_timeout', 'model_busy', 'ai_invalid_move', 'dafeiyu_error', 'dafeiyu_busy',
+        && ['model_error', 'model_timeout', 'model_busy', 'model_output_truncated', 'model_output_empty',
+          'ai_invalid_move', 'dafeiyu_error', 'dafeiyu_busy',
           'dafeiyu_timeout', 'dafeiyu_invalid_move', 'dafeiyu_output_invalid', 'dafeiyu_model_error',
           'dafeiyu_disconnected', 'step_failed'].includes(pausedCode)
         && Boolean(runtime)
@@ -609,7 +656,12 @@ export class MatchService {
     if (!game) {
       throw new ArenaError('game_not_found', '未找到这个桌游插件。', { status: 404 });
     }
-    const defs = seatByOrder(game);
+    const allSeats = seatByOrder(game);
+    const count = payload.playerCount ?? game.minPlayers;
+    if (game.variableSeats && (!Number.isInteger(count) || count < game.minPlayers || count > game.maxPlayers)) {
+      throw new ArenaError('invalid_seats', '本游戏只支持 2–4 个座位。');
+    }
+    const defs = game.variableSeats ? allSeats.slice(0, count) : allSeats;
     let rawSeats = payload.seats;
     if (Array.isArray(rawSeats)) {
       rawSeats = Object.fromEntries(rawSeats.filter((seat) => seat?.id).map((seat) => [seat.id, seat]));
@@ -636,6 +688,7 @@ export class MatchService {
       pending: null,
       stepOnce: false,
       scheduleTimer: null,
+      viewerReleaseTimer: null,
       modelConfigs: {},
       dafeiyu: null,
       dafeiyuBusy: false,
@@ -671,7 +724,7 @@ export class MatchService {
     if (dafeiyuEnabled) await this._releaseTerminalDafeiyuSessions();
     const now = nowIso();
     const seed = createSeed();
-    const initialState = game.createInitialState({ seed });
+    const initialState = game.createInitialState({ seed, seatIds: defs.map(seat => seat.id) });
     const match = {
       schemaVersion: 2,
       id: createId('match'),
@@ -688,6 +741,7 @@ export class MatchService {
       randomEvents: [],
       privateBySeat: {},
       modeLabel: this._modeLabel(game, seats),
+      aiPace: payload.aiPace === 'fast' ? 'fast' : 'quality',
       seats,
       seatOrder: defs.map((seat) => seat.id),
       state: initialState,
@@ -792,7 +846,7 @@ export class MatchService {
 
   async _connectDafeiyu(match, { initial = false } = {}) {
     const runtime = this._runtime(match.id);
-    if (!runtime || runtime.archived) return false;
+    if (this.closed || !runtime || runtime.archived) return false;
     if (!match.dafeiyu.enabled) {
       match.dafeiyu.status = 'off';
       return false;
@@ -810,10 +864,12 @@ export class MatchService {
     this._persist(match);
     const settings = this.configStore.dafeiyuSettings();
     const client = this._makeDafeiyuClient(settings);
+    const connection = Symbol('dafeiyu connection');
+    runtime.dafeiyuConnection = connection;
     try {
       const result = await client.connect({ matchId: match.id, client: `AI Arena ${this.version}` });
-      if (!this.matches.has(match.id) || !match.dafeiyu.enabled) {
-        void client.leave({ sessionId: result.sessionId, matchId: match.id }).catch(() => {});
+      if (this.closed || runtime.dafeiyuConnection !== connection || !match.dafeiyu.enabled) {
+        await client.leave({ sessionId: result.sessionId, matchId: match.id }).catch(() => {});
         return false;
       }
       runtime.dafeiyu = {
@@ -831,6 +887,7 @@ export class MatchService {
       this._startHealth(match);
       return true;
     } catch (error) {
+      if (this.closed || runtime.dafeiyuConnection !== connection) return false;
       const publicError = error instanceof DafeiyuError
         ? error.toPublic()
         : { code: 'dafeiyu_error', message: '连接大肥鱼失败。' };
@@ -854,6 +911,8 @@ export class MatchService {
       this._persist(match);
       if (initial) this.logger.warn?.(`大肥鱼连接失败（${match.id}）：${publicError.message}`);
       return false;
+    } finally {
+      if (runtime.dafeiyuConnection === connection) runtime.dafeiyuConnection = null;
     }
   }
 
@@ -885,20 +944,21 @@ export class MatchService {
       this._clearHealth(matchId);
       return;
     }
-    runtime.dafeiyu.checking = true;
+    const session = runtime.dafeiyu;
+    session.checking = true;
     try {
-      await runtime.dafeiyu.client.status({
-        sessionId: runtime.dafeiyu.sessionId,
+      await session.client.status({
+        sessionId: session.sessionId,
         matchId: match.id,
       });
     } catch (error) {
-      if (!this.matches.has(matchId)) return;
+      if (this.closed || runtime.dafeiyu !== session) return;
       const wasConnected = match.dafeiyu.status === 'connected';
       if (wasConnected) {
         this._markDafeiyuDisconnected(match, error, '大肥鱼连接已断开');
       }
     } finally {
-      if (runtime.dafeiyu) runtime.dafeiyu.checking = false;
+      session.checking = false;
     }
   }
 
@@ -932,14 +992,84 @@ export class MatchService {
     }
   }
 
+  _automaticAction(match, seatId = this._currentSeat(match)) {
+    if (!match || match.status !== 'playing' || !seatId) return null;
+    const game = this._gameFor(match);
+    if (typeof game?.getAutomaticAction !== 'function') return null;
+    try {
+      const action = game.getAutomaticAction({ state: match.state, seatId });
+      return action && typeof action === 'object' ? action : null;
+    } catch (error) {
+      this.logger.warn?.(`自动动作生成失败：${error.message}`);
+      return null;
+    }
+  }
+
+  _applyAutomaticAction(match, seat, action) {
+    const runtime = this._runtime(match.id);
+    if (!runtime || runtime.archived || runtime.pending) return false;
+    if (match.status !== 'playing' && !runtime.stepOnce) return false;
+    const game = this._gameFor(match);
+    if (!game) return false;
+    const pauseForChat = Boolean(runtime.pauseAfterMove);
+    const wasStep = runtime.stepOnce || pauseForChat;
+    runtime.pauseAfterMove = false;
+    runtime.stepOnce = false;
+    const validation = game.validateAction(match.state, seat, action);
+    if (!validation.ok) {
+      this._recordError(match, {
+        code: validation.code,
+        message: validation.message,
+        seat,
+        source: 'system',
+      });
+      this._persist(match);
+      return false;
+    }
+    const accepted = this._acceptAction(match, {
+      seat,
+      action: validation.action,
+      source: 'system',
+      sourceName: '系统跳过',
+      metrics: { attempts: 1, failures: [], elapsedMs: 0, moveMode: null },
+    });
+    if (wasStep && match.status !== 'finished') {
+      match.status = 'paused';
+      match.pause = {
+        at: nowIso(),
+        code: 'step_done',
+        reason: pauseForChat ? '当前步已完成，对局暂停，可以聊天。' : '已完成单步推进，对局保持暂停。',
+        resumeable: true,
+      };
+      this._event(match, 'step_done', {});
+    }
+    this._persist(match);
+    if (wasStep) {
+      this._clearSchedule(match.id);
+    } else if (match.status === 'playing') {
+      this._scheduleAi(match, { delayMs: 0 });
+    }
+    if (match.status === 'finished') {
+      this._clearHealth(match.id);
+      this._scheduleDafeiyuRelease(match);
+    }
+    if (accepted.candidates.length) {
+      void this._maybeAutoComment(match, accepted.candidates);
+    }
+    return true;
+  }
+
   _scheduleAi(match, { delayMs = null } = {}) {
     if (this.closed) return;
     const runtime = this._runtime(match.id);
     if (!runtime || runtime.archived || runtime.pending || runtime.scheduleTimer) return;
     if (match.status !== 'playing') return;
     const seatId = this._currentSeat(match);
-    if (!seatId || match.seats[seatId].kind === 'human') return;
-    const delay = delayMs ?? this.configStore.matchSettings.aiMoveDelayMs;
+    if (!seatId) return;
+    const automatic = this._automaticAction(match, seatId);
+    if (!automatic && match.seats[seatId].kind === 'human') return;
+    const delay = delayMs ?? (automatic || match.aiPace === 'fast' ? 0 : this.configStore.matchSettings.aiMoveDelayMs);
+    runtime.scheduledAt = Date.now();
     runtime.scheduleTimer = setTimeout(() => {
       runtime.scheduleTimer = null;
       void this._beginAiTurn(match.id, { singleStep: false });
@@ -986,6 +1116,11 @@ export class MatchService {
     }
     const seat = this._currentSeat(match);
     if (!seat) return;
+    const automatic = this._automaticAction(match, seat);
+    if (automatic) {
+      this._applyAutomaticAction(match, seat, automatic);
+      return;
+    }
     const seatConfig = match.seats[seat];
     if (seatConfig.kind === 'human') return;
     if (seatConfig.kind === 'dafeiyu' && match.dafeiyu.status !== 'connected') {
@@ -1002,6 +1137,10 @@ export class MatchService {
       this._abortAutoComment(match, '轮到棋手落子，自动点评让位');
     }
     const requestId = createId('move');
+    const modelMaxOutputTokens = Math.min(
+      MAX_MODEL_MOVE_TOKENS,
+      Math.max(256, Number(runtime.modelConfigs[seat]?.maxOutputTokens) || 4800),
+    );
     const context = {
       requestId,
       seat,
@@ -1010,9 +1149,18 @@ export class MatchService {
       singleStep: Boolean(singleStep),
       controller: new AbortController(),
       feedback: '',
+      modelMaxTokens: Math.min(MODEL_MOVE_TOKENS, modelMaxOutputTokens),
+      modelMaxOutputTokens,
       startedAt: Date.now(),
       failures: [],
+      timings: [],
+      queuedMs: singleStep || !runtime.scheduledAt ? 0 : Date.now() - runtime.scheduledAt,
+      fast: match.aiPace === 'fast',
     };
+    if (context.fast) {
+      context.deadline = context.startedAt + FAST_MOVE_MS;
+      // A deadline never silently changes thinking or the configured output budget.
+    }
     const maxAttempts = seatConfig.kind === 'bot'
       ? 1
       : Math.max(
@@ -1057,48 +1205,34 @@ export class MatchService {
       mustBlocks: Array.isArray(hints.mustBlocks) ? hints.mustBlocks : [],
       doubleThreatMoves: Array.isArray(hints.doubleThreatMoves) ? hints.doubleThreatMoves : [],
       notes: Array.isArray(hints.notes) ? hints.notes.slice(0, 8) : [],
+      ...(hints.candidateInfo && typeof hints.candidateInfo === 'object'
+        ? { candidateInfo: hints.candidateInfo }
+        : {}),
     };
   }
 
-  _modelMoveDescription(match, game, seatId, mode) {
+  _modelMoveDescription(match, game, seatId, mode, fast = false) {
     const description = game.describeForModel({
       state: match.state,
       seatId,
       mode,
       recentActions: match.actions.slice(-8),
+      allowSpeech: match.seats[seatId]?.kind === 'dafeiyu',
     });
     const assisted = mode === 'assisted' ? this._assistedContext(game, match.state, seatId) : null;
+
     return { description, assisted };
   }
 
-  async _requestAiAction(match, context) {
-    const runtime = this._runtime(match.id);
-    const seatConfig = match.seats[context.seat];
-    const game = this._gameFor(match);
-    if (!game) throw new Error('游戏插件不存在');
-    if (seatConfig.kind === 'bot') {
-      const bot = new BuiltInBot({ game, seat: context.seat, seed: match.seed });
-      const action = await bot.chooseAction(match.state);
-      return { action, say: '', source: 'bot', sourceName: seatConfig.name };
-    }
-    if (seatConfig.kind === 'model') {
-      const config = runtime.modelConfigs[context.seat];
-      if (!config) {
-        throw new ModelError('unavailable', '这一席位的模型配置已不可用，请重新配置。', {
-          stage: 'config',
-          retryable: false,
-        });
-      }
-      const mode = seatConfig.moveMode === 'assisted' ? 'assisted' : 'pure';
-      const { description, assisted } = this._modelMoveDescription(match, game, context.seat, mode);
-      const visibleSeat = match.seats[context.seat] ?? {};
-      const seatLabel = visibleSeat.colorName || description.seatLabel || context.seat;
+  _moveMessages(match, game, seat, mode, config, description, assisted, feedback = '') {
+      const visibleSeat = match.seats[seat] ?? {};
+      const seatLabel = visibleSeat.colorName || description.seatLabel || seat;
       const messages = [
         {
           role: 'system',
           content: [
-            `你是「${config.name}」，正在 AI Arena 中执${seatLabel}（座位 ${context.seat}，${visibleSeat.name || ''}）。`,
-            '严格依据给定规则、局面和动作格式行动；只输出一个 JSON 对象，不要 Markdown、不要代码围栏、不要解释过程。',
+            `你是「${config.name}」，正在 AI Arena 中执${seatLabel}（座位 ${seat}，${visibleSeat.name || ''}）。`,
+            '严格依据给定规则和局面，只输出动作 JSON。不要附带发言、说明、Markdown 或代码围栏。',
             `必须使用的动作格式：${description.responseFormat || '{"move":"..."}'}`,
             mode === 'assisted'
               ? '这是规则辅助模式：可以参考提供了合法候选、立即成五点和必堵点，但最终仍必须给出一个合法动作。'
@@ -1118,37 +1252,103 @@ export class MatchService {
               ? `你的座位可见信息：\n${JSON.stringify(description.privateContext)}`
               : '',
             assisted ? `规则辅助信息：\n${JSON.stringify(assisted)}` : '',
-            context.feedback ? `上一次提交无效：${context.feedback}\n请重新给出一个完整合法动作。` : '',
+            feedback ? `上一次提交无效：${feedback}\n请重新给出一个完整合法动作。` : '',
             '现在只返回一个合法 JSON 对象。',
           ].filter(Boolean).join('\n\n'),
         },
       ];
+    return messages;
+  }
+
+  benchmarkPosition(matchId, step, mode, config) {
+    const original=this._getMatch(matchId); const game=this._gameFor(original);
+    if(!game || original.rulesVersion!==game.rulesVersion) throw Object.assign(new Error('规则版本不一致，不能重建测速局面。'),{status:409,code:'rules_mismatch'});
+    if(!Number.isInteger(step)||step<0||step>original.actions.length)throw Object.assign(new Error('无效的测速步数。'),{status:400,code:'invalid_step'});
+    let state=game.createInitialState({seed:original.seed,seatIds:original.seatOrder});
+    for(const action of original.actions.slice(0,step))state=game.applyAction(state,action.seat,action.action).state;
+    const match={...original,state,actions:original.actions.slice(0,step)};
+    const seat=currentSeat(game,state);
+    if(!seat || game.getOutcome(state))throw Object.assign(new Error('该局面已经结束，请选更早一步。'),{status:400,code:'terminal_position'});
+    const {description,assisted}=this._modelMoveDescription(match,game,seat,mode,false);
+    return {state,game,seat,messages:this._moveMessages(match,game,seat,mode,config,description,assisted)};
+  }
+
+  async _requestAiAction(match, context) {
+    const runtime = this._runtime(match.id);
+    const seatConfig = match.seats[context.seat];
+    const game = this._gameFor(match);
+    if (!game) throw new Error('游戏插件不存在');
+    if (seatConfig.kind === 'bot') {
+      const bot = new BuiltInBot({ game, seat: context.seat, seed: match.seed });
+      const action = await bot.chooseAction(match.state);
+      return { action, say: '', source: 'bot', sourceName: seatConfig.name };
+    }
+    if (seatConfig.kind === 'model') {
+      const saved = runtime.modelConfigs[context.seat];
+      const config = saved && context.fast ? { ...saved, timeoutMs: Math.min(saved.timeoutMs, context.remaining) } : saved;
+      if (!config) {
+        throw new ModelError('unavailable', '这一席位的模型配置已不可用，请重新配置。', {
+          stage: 'config',
+          retryable: false,
+        });
+      }
+      const mode = seatConfig.moveMode === 'assisted' ? 'assisted' : 'pure';
+      const { description, assisted } = this._modelMoveDescription(match, game, context.seat, mode, context.fast);
+      const messages = this._moveMessages(match, game, context.seat, mode, config, description, assisted, context.feedback);
       const completion = await requestModelCompletion(config, {
         messages,
         temperature: 0.2,
-        // DeepSeek 等默认开启思考模式的模型会先消耗 completion tokens 生成
-        // reasoning_content。输出上限太小会让正文为空且 finish_reason=length，
-        // 看起来像“模型返回了空内容”。给正文留足预算。
-        maxTokens: 1200,
+        maxTokens: context.modelMaxTokens,
         signal: context.controller.signal,
+        measureStream: resultStreamAllowed(config),
+        monitor:this.monitor,
+        monitorContext:{task:'move',matchId:match.id,gameId:match.gameId,seat:context.seat,step:match.actions.length+1,
+          pace:match.aiPace??'quality',moveMode:mode,attempt:runtime.pending?.attempt??1},
       });
       const parsed = game.parseModelMove(completion.text);
+      if(!parsed.ok)this.monitor?.outcome(completion.monitorId,false,completion.finishReason==='length'?'model_output_truncated':'invalid_move');
       if (!parsed.ok) {
-        const error = new ModelError('ai_invalid_move', parsed.error, {
+        if (completion.finishReason === 'length') {
+          throw new ModelError('model_output_truncated',
+            `模型在 ${context.modelMaxTokens} token 的输出上限前没有完成落子。`, {
+              stage: 'response',
+              retryable: context.modelMaxTokens < context.modelMaxOutputTokens,
+            });
+        }
+        if (!completion.text.trim()) {
+          throw new ModelError('model_output_empty', '模型没有返回落子正文。', {
+            stage: 'response',
+            retryable: true,
+          });
+        }
+        throw new ModelError('ai_invalid_move', parsed.error, {
           stage: 'model',
           retryable: true,
         });
-        throw error;
       }
       return {
         action: parsed.action,
-        say: parsed.say,
         source: 'model',
         sourceName: config.name,
         modelMeta: {
+          monitorId: completion.monitorId,
+          reasoning: completion.reasoning,
           modelConfigId: config.id,
           modelId: config.modelId,
           provider: config.provider,
+          reasoningEffort: config.reasoningEffort ?? 'default',
+          maxOutputTokens: config.maxOutputTokens ?? null,
+          maxTokens: context.modelMaxTokens,
+          finishReason: completion.finishReason ?? null,
+          requestTiming: completion.timing ?? null,
+          aiPace: context.fast ? 'fast' : 'quality',
+          tokenUsage: completion.usage ? {
+            promptTokens: completion.usage.prompt_tokens ?? null,
+            completionTokens: completion.usage.completion_tokens ?? null,
+            totalTokens: completion.usage.total_tokens ?? null,
+            reasoningTokens: completion.usage.completion_tokens_details?.reasoning_tokens ?? null,
+          } : null,
+          ...(assisted?.candidateInfo ? { candidateInfo: assisted.candidateInfo } : {}),
         },
       };
     }
@@ -1163,6 +1363,7 @@ export class MatchService {
         seat: context.seat,
         turn: context.seat,
         mode: seatConfig.moveMode ?? 'pure',
+        fast: context.fast,
       });
       const response = await runtime.dafeiyu.client.move({
         sessionId: runtime.dafeiyu.sessionId,
@@ -1172,6 +1373,7 @@ export class MatchService {
         feedback: context.feedback,
         requestId: context.requestId,
         signal: context.controller.signal,
+        timeoutMs: context.fast ? context.remaining : undefined,
       });
       const raw = typeof response.raw === 'string'
         ? response.raw
@@ -1182,12 +1384,16 @@ export class MatchService {
       if (!parsed.ok) {
         throw new DafeiyuError('model_invalid_content', parsed.error, { retryable: true });
       }
-      const say = compactText(response.say ?? parsed.say ?? '', 120);
+      const say = game.hiddenShuffle ? '' : compactText(response.say ?? parsed.say ?? '', 120);
       return {
         action: parsed.action,
         say,
         source: 'dafeiyu',
         sourceName: match.dafeiyu.personaName || '大肥鱼',
+        modelMeta: {
+          ...(response.modelMeta ?? {}),
+          ...(snapshot.assisted?.candidateInfo ? { candidateInfo: snapshot.assisted.candidateInfo } : {}),
+        },
       };
     }
     throw new ArenaError('invalid_seat', '该座位不支持自动落子。');
@@ -1211,6 +1417,7 @@ export class MatchService {
       return 'dafeiyu_error';
     }
     if (phase === 'validation' || error?.code === 'ai_invalid_move') return 'ai_invalid_move';
+    if (['model_output_truncated', 'model_output_empty'].includes(error?.code)) return error.code;
     if (error?.code === 'timeout') return 'model_timeout';
     if (['rate_limited', 'model_busy'].includes(error?.code)) return 'model_busy';
     if (error?.code === 'cancelled') return 'cancelled';
@@ -1222,6 +1429,12 @@ export class MatchService {
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
       if (!this._isActiveRequest(match, runtime, context)) return;
       runtime.pending.attempt = attempt;
+      context.remaining = context.deadline == null ? Infinity : context.deadline - Date.now();
+      if (context.remaining <= 0) {
+        const code = match.seats[context.seat].kind === 'dafeiyu' ? 'dafeiyu_timeout' : 'model_timeout';
+        this._failAiTurn(match, context, { code, reason: '限时模式的单步总时限已到。', attempts: attempt - 1 });
+        return;
+      }
       const seatConfigNow = match.seats[context.seat];
       const seatLabel = seatConfigNow.colorName || seatConfigNow.name;
       const kind = seatConfigNow.kind;
@@ -1237,29 +1450,43 @@ export class MatchService {
           kind,
         ),
         maxAttempts,
+        deadlineAt: context.deadline ? new Date(context.deadline).toISOString() : null,
       };
       this._persist(match);
       let result;
+      const attemptStart = Date.now();
       try {
         result = await this._requestAiAction(match, context);
+        context.timings.push({ attempt, elapsedMs: Date.now() - attemptStart });
       } catch (error) {
         if (!this._isActiveRequest(match, runtime, context)) return;
         const seatKind = match.seats[context.seat].kind;
         const code = this._aiErrorCode(error, seatKind);
+        context.timings.push({ attempt, elapsedMs: Date.now() - attemptStart, code });
         context.failures.push({ code, message: compactText(error?.message ?? '未知错误', 300) });
         const retryableCodes = new Set([
           'dafeiyu_output_invalid',
           'dafeiyu_timeout',
           'ai_invalid_move',
+          'model_output_truncated',
+          'model_output_empty',
           'model_error',
           'model_timeout',
         ]);
         const retryable = error?.retryable !== false
           && retryableCodes.has(code)
           && error?.code !== 'cancelled'
-          && attempt < maxAttempts;
+          && attempt < maxAttempts && (context.deadline == null || Date.now() + 700 < context.deadline);
         if (retryable) {
-          context.feedback = error?.message ?? '上一次落子无效。';
+          if (code === 'model_output_truncated') {
+            context.modelMaxTokens = Math.min(
+              context.modelMaxTokens * 2,
+              context.modelMaxOutputTokens,
+            );
+          }
+          context.feedback = code === 'model_output_truncated' || code === 'model_output_empty'
+            ? '上次没有收到完整动作。请尽快提交一个完整动作 JSON。'
+            : error?.message ?? '上一次落子无效。';
           await sleep(120);
           continue;
         }
@@ -1285,9 +1512,10 @@ export class MatchService {
       const game = this._gameFor(match);
       const validation = game.validateAction(match.state, context.seat, result.action);
       if (!validation.ok) {
+        this.monitor?.outcome(result.modelMeta?.monitorId,false,'illegal_action');
         const code = this._aiErrorCode(new Error(validation.message), match.seats[context.seat].kind, { phase: 'validation' });
         context.failures.push({ code, message: validation.message });
-        if (attempt < maxAttempts) {
+        if (attempt < maxAttempts && (context.deadline == null || Date.now() + 700 < context.deadline)) {
           context.feedback = validation.message;
           await sleep(120);
           continue;
@@ -1305,6 +1533,7 @@ export class MatchService {
         });
         return;
       }
+      this.monitor?.outcome(result.modelMeta?.monitorId,true);
       const finishedAt = Date.now();
       await this._commitAiAction(match, context, {
         ...result,
@@ -1312,6 +1541,8 @@ export class MatchService {
         metrics: {
           attempts: attempt,
           failures: context.failures.slice(0, 10),
+          attemptsTiming: context.timings,
+          queuedMs: context.queuedMs,
           elapsedMs: Math.max(0, finishedAt - context.startedAt),
           moveMode: match.seats[context.seat].moveMode ?? null,
         },
@@ -1331,7 +1562,9 @@ export class MatchService {
   async _commitAiAction(match, context, result) {
     const runtime = this._runtime(match.id);
     if (!this._isActiveRequest(match, runtime, context)) return;
-    const wasStep = runtime.stepOnce;
+    const pauseForChat = Boolean(runtime.pauseAfterMove);
+    const wasStep = runtime.stepOnce || pauseForChat;
+    runtime.pauseAfterMove = false;
     this._clearPending(match, runtime);
     runtime.stepOnce = false;
     const accepted = this._acceptAction(match, {
@@ -1350,7 +1583,7 @@ export class MatchService {
       match.pause = {
         at: nowIso(),
         code: 'step_done',
-        reason: '已完成单步推进，对局保持暂停。',
+        reason: pauseForChat ? '当前步已完成，对局暂停，可以聊天。' : '已完成单步推进，对局保持暂停。',
         resumeable: true,
       };
       this._event(match, 'step_done', {});
@@ -1359,10 +1592,7 @@ export class MatchService {
     if (wasStep && match.status === 'paused') {
       this._clearSchedule(match.id);
     } else if (match.status === 'playing') {
-      const nextSeat = this._currentSeat(match);
-      if (nextSeat && match.seats[nextSeat].kind !== 'human') {
-        this._scheduleAi(match);
-      }
+      this._scheduleAi(match);
     }
     if (match.status === 'finished') {
       this._clearHealth(match.id);
@@ -1423,9 +1653,9 @@ export class MatchService {
       index: entry.index,
       outcome: applied.state.outcome,
     });
-    if (say) {
+    if (say && source === 'dafeiyu') {
       this._addChat(match, {
-        role: source === 'dafeiyu' ? 'dafeiyu' : 'ai',
+        role: 'dafeiyu',
         text: compactText(say, 160),
         kind: 'thought',
         seat,
@@ -1539,8 +1769,7 @@ export class MatchService {
       };
     }
     this._persist(match);
-    const nextSeat = this._currentSeat(match);
-    if (match.status === 'playing' && nextSeat && match.seats[nextSeat].kind !== 'human') {
+    if (match.status === 'playing') {
       this._scheduleAi(match);
     }
     if (match.status === 'finished') {
@@ -1593,6 +1822,16 @@ export class MatchService {
     }
   }
 
+  pauseAfterMove(matchId) {
+    const match=this._getMatch(matchId),runtime=this._runtime(matchId);
+    if(!runtime||runtime.archived)throw new ArenaError('archived_match','归档对局不能操作。',{status:409});
+    if(match.status!=='playing')return this.publicMatch(match);
+    if(!runtime.pending)return this.pauseMatch(matchId);
+    runtime.pauseAfterMove=true;
+    if(match.pending)match.pending.pauseAfterMove=true;
+    this._event(match,'pause_after_move',{});this._persist(match);return this.publicMatch(match);
+  }
+
   pauseMatch(matchId) {
     const match = this._getMatch(matchId);
     const runtime = this._runtime(matchId);
@@ -1633,10 +1872,7 @@ export class MatchService {
     match.pause = null;
     this._event(match, 'match_resumed', {});
     this._persist(match);
-    const current = this._currentSeat(match);
-    if (current && match.seats[current].kind !== 'human') {
-      this._scheduleAi(match, { delayMs: 0 });
-    }
+    this._scheduleAi(match, { delayMs: 0 });
     return this.publicMatch(match);
   }
 
@@ -1736,28 +1972,35 @@ export class MatchService {
     return this.publicMatch(match);
   }
 
-  _integrationSnapshot(match, { role, seat = null, turn = null, mode = 'pure' }) {
+  _integrationSnapshot(match, { role, seat = null, turn = null, mode = 'pure', publicOnly = false, fast = false }) {
     const game = this._gameFor(match);
     if (!game) throw new ArenaError('game_not_found', '找不到这局使用的桌游。', { status: 404 });
-    const viewer = { role, seat };
+    const viewer = publicOnly ? { role: 'observer', seat: null } : { role, seat };
     const visibleActions = filterVisible(match.actions, viewer);
     const current = this._currentSeat(match);
     const seatId = seat ?? turn ?? current ?? game.seats[0]?.id ?? null;
-    const view = role === 'player' && seat
+    const view = !publicOnly && role === 'player' && seat
       ? game.getSeatView(match.state, seat)
       : game.getPublicState(match.state);
-    const { description, assisted } = this._modelMoveDescription(match, game, seatId, mode);
+    const { description, assisted } = this._modelMoveDescription(match, game, seatId, publicOnly ? 'pure' : mode, fast);
     const seatLabel = seatId ? this._seatLabel(match, seatId) : null;
     return {
       protocolVersion: 2,
+      pace: match.aiPace ?? 'quality',
+      inference: { thinkingMode:this.configStore.dafeiyuSettings().moveThinkingMode??'off',
+        adapter:this.configStore.dafeiyuSettings().moveReasoningAdapter??'qwen',
+        effort:this.configStore.dafeiyuSettings().moveReasoningEffort??'default',
+        maxOutputTokens:this.configStore.dafeiyuSettings().moveMaxOutputTokens??8192,
+        timeoutSeconds:fast?25:Math.min(600,(this.configStore.dafeiyuSettings().timeoutMs??90000)/1000) },
       matchId: match.id,
       role,
       seat,
       seatLabel,
-      seats: seatByOrder(game).map((def) => ({
+      seats: seatByOrder(game).filter(def => match.seats[def.id]).map((def) => ({
         id: def.id,
         name: def.name,
         colorName: match.seats[def.id]?.colorName ?? def.name,
+        participantName: match.seats[def.id]?.name ?? def.name,
         kind: match.seats[def.id]?.kind ?? null,
       })),
       game: {
@@ -1770,10 +2013,11 @@ export class MatchService {
         moveMode: mode,
       },
       moveMode: mode,
-      assisted: mode === 'assisted' ? assisted : null,
+      assisted: !publicOnly && mode === 'assisted' ? assisted : null,
       turn: current,
       turnSeatName: current ? this._seatLabel(match, current) : null,
       moveCount: match.actions.length,
+      ...(match.gameId === 'splendor' ? { lastEvent: match.actions.at(-1)?.event ?? null } : {}),
       state: view,
       outcome: match.outcome,
       recentActions: visibleActions.slice(-8).map((entry) => ({
@@ -1816,7 +2060,11 @@ export class MatchService {
     if (match.dafeiyu.status !== 'connected') return;
     if (this.hub.count(match.id) < 1) return;
     const runtime = this._runtime(match.id);
-    if (!runtime?.dafeiyu || runtime.autoPendingKey) return;
+    if (!runtime?.dafeiyu) return;
+    if (runtime.autoPendingKey) {
+      if (!candidates.some(candidate => AUTO_PRIORITY.has(candidate.type))) return;
+      this._abortAutoComment(match, '终局已发生，取消旧局面点评');
+    }
     // 落子优先：轮到入座的大肥鱼时，不启动任何低优先级点评。
     const current = this._currentSeat(match);
     const dafeiyuSeat = this._dafeiyuSeat(match);
@@ -1862,6 +2110,7 @@ export class MatchService {
         seat,
         turn: this._currentSeat(match),
         mode: dafeiyuSeat?.moveMode ?? 'pure',
+        publicOnly: gameUsesHiddenState(match, this.gameMap),
       });
       const response = await session.client.comment({
         sessionId: session.sessionId,
@@ -1878,7 +2127,7 @@ export class MatchService {
         mode: 'auto',
         signal: controller.signal,
       });
-      if (this.hub.count(match.id) < 1) return;
+      if (controller.signal.aborted || this.hub.count(match.id) < 1) return;
       if (match.status === 'aborted') return;
       if (!match.dafeiyu.enabled || !match.dafeiyu.autoComment) return;
       if (match.dafeiyu.status !== 'connected') return;
@@ -1931,13 +2180,13 @@ export class MatchService {
         if (runtime.autoPendingKey === candidate.key) runtime.autoPendingKey = null;
         if (runtime.autoAbort === controller) runtime.autoAbort = null;
       }
-      if (match.status === 'finished' || match.status === 'aborted') {
-        this._scheduleDafeiyuRelease(match, { delayMs: 5000 });
+      if (!runtime?.autoPendingKey && (match.status === 'finished' || match.status === 'aborted')) {
+        this._scheduleDafeiyuRelease(match);
       }
     }
   }
 
-  async askDafeiyu(matchId, { text, voice = null } = {}) {
+  async askDafeiyu(matchId, { text, voice = null, analysis = false } = {}) {
     const match = this._getMatch(matchId);
     const runtime = this._runtime(matchId);
     if (!runtime || runtime.archived) {
@@ -1977,7 +2226,9 @@ export class MatchService {
         seat,
         turn: current,
         mode: dafeiyuSeat?.moveMode ?? 'pure',
+        publicOnly: gameUsesHiddenState(match, this.gameMap),
       });
+      snapshot.inference = { ...snapshot.inference, analysis: analysis === true };
       const response = await session.client.question({
         sessionId: session.sessionId,
         matchId: match.id,
@@ -2105,7 +2356,8 @@ export class MatchService {
     );
     runtime.dafeiyuReleaseTimer = setTimeout(() => {
       runtime.dafeiyuReleaseTimer = null;
-      void this._releaseDafeiyuSession(match.id);
+      if (runtime.autoPendingKey || runtime.dafeiyuBusy) this._scheduleDafeiyuRelease(match, { delayMs: 5000 });
+      else void this._releaseDafeiyuSession(match.id);
     }, wait);
     runtime.dafeiyuReleaseTimer.unref?.();
   }
@@ -2148,26 +2400,53 @@ export class MatchService {
     if (tasks.length) await Promise.allSettled(tasks);
   }
 
+  cancelViewerRelease(matchId) {
+    const runtime = this._runtime(matchId);
+    if (!runtime?.viewerReleaseTimer) return;
+    clearTimeout(runtime.viewerReleaseTimer);
+    runtime.viewerReleaseTimer = null;
+  }
+
+  scheduleViewerRelease(matchId) {
+    const runtime = this._runtime(matchId);
+    if (this.closed || !runtime || runtime.archived || this.hub.count(matchId) > 0) return;
+    if (runtime.viewerReleaseTimer) return;
+    // EventSource 有 3 秒的重连间隔，给刷新和短暂断线留一点时间。
+    runtime.viewerReleaseTimer = setTimeout(() => {
+      runtime.viewerReleaseTimer = null;
+      void this.leaveMatch(matchId, { reason: '最后一个对局页面已离开' }).catch((error) => {
+        this.logger.error?.(`释放对局资源失败（${matchId}）：${error.message}`);
+      });
+    }, VIEWER_RECONNECT_GRACE_MS);
+    runtime.viewerReleaseTimer.unref?.();
+  }
+
   async leaveMatch(matchId, { reason = '离开对局页面' } = {}) {
     const match = this._getMatch(matchId);
     const runtime = this._runtime(matchId);
-    if (!runtime) return this.publicMatch(match);
-    this._abortAutoComment(match, reason);
-    this._abortDafeiyuQuestion(match, reason);
-    if (match.status === 'playing' && this._hasDafeiyuSeat(match)) {
+    if (this.closed || !runtime || runtime.archived || this.hub.count(matchId) > 0) {
+      return this.publicMatch(match);
+    }
+    this.cancelViewerRelease(matchId);
+    if (match.status !== 'playing' && !runtime.pending && !runtime.dafeiyu
+      && match.dafeiyu.status !== 'connecting') return this.publicMatch(match);
+
+    if (match.status === 'playing' || runtime.pending) {
       this._pauseMatch(match, {
         code: 'page_left',
-        reason: '已离开对局页面，大肥鱼会话已释放。返回后点“重新连接”，再继续。',
+        reason: this._hasDafeiyuSeat(match)
+          ? '已离开对局页面。返回后请重新连接大肥鱼，再继续。'
+          : '已离开对局页面，模型回合已暂停。返回后可继续。',
         resumeable: true,
       });
     }
-    this._cancelDafeiyuSpeech(match);
-    if (match.dafeiyu.enabled) {
-      await this._disconnectDafeiyuSession(match);
-      match.dafeiyu.status = 'disconnected';
-    }
+    const disconnected = match.dafeiyu.enabled
+      ? this._disconnectDafeiyuSession(match)
+      : null;
+    if (disconnected) match.dafeiyu.status = 'disconnected';
     this._event(match, 'viewer_left', { reason: compactText(reason, 120) });
     this._persist(match);
+    if (disconnected) await disconnected;
     return this.publicMatch(match);
   }
 
@@ -2185,7 +2464,8 @@ export class MatchService {
       });
       if (runtime.dafeiyu?.sessionId !== session.sessionId) return;
       const chat = match.chat.find((item) => item.id === chatId);
-      if (chat) chat.voiceStatus = result.voiceStatus ?? 'unknown';
+      if (!match.dafeiyu.voice || !chat || chat.voiceStatus === 'cancelled') return;
+      chat.voiceStatus = result.voiceStatus ?? 'unknown';
       this._persist(match);
     } catch (error) {
       if (!this.matches.has(match.id)) return;
@@ -2256,7 +2536,10 @@ export class MatchService {
     }
     this._cancelDafeiyuSpeech(match);
     const session = runtime?.dafeiyu;
-    if (runtime) runtime.dafeiyu = null;
+    if (runtime) {
+      runtime.dafeiyuConnection = null;
+      runtime.dafeiyu = null;
+    }
     if (session) {
       try {
         await session.client.leave({ sessionId: session.sessionId, matchId: match.id });
@@ -2388,6 +2671,7 @@ export class MatchService {
         source: entry?.source ?? null,
         sourceName: entry?.sourceName ?? null,
         metrics: entry?.metrics ?? null,
+        modelMeta: entry?.modelMeta ?? null,
         view: snapshot.view,
       });
     }
@@ -2403,8 +2687,8 @@ export class MatchService {
       seatOrder: this._seatList(match).map((seat) => seat.id),
       authoritative: true,
       initialView: initial?.view ?? null,
-      seed: match.seed ?? null,
-      randomEvents: Array.isArray(match.randomEvents) ? match.randomEvents.slice() : [],
+      seed: game.hiddenShuffle ? null : match.seed ?? null,
+      randomEvents: !game.hiddenShuffle && Array.isArray(match.randomEvents) ? match.randomEvents.slice() : [],
       steps,
       // 与网页既有语义一致：totalSteps 是最后一手的索引，steps[0] 是初始局面。
       totalSteps: Math.max(0, steps.length - 1),
@@ -2423,6 +2707,7 @@ export class MatchService {
       winnerSeat: match.winnerSeat ?? null,
       winnerName: match.winnerName ?? null,
       modeLabel: match.modeLabel,
+      aiPace: match.aiPace ?? 'quality',
       configSnapshot: match.configSnapshot,
       actionCount: match.actions.length,
       replayVersion: 2,
@@ -2452,21 +2737,17 @@ export class MatchService {
 
   async close() {
     this.closed = true;
+    const disconnects = [];
     for (const [id, runtime] of this.runtimes) {
       const match = this.matches.get(id);
       this._clearSchedule(id);
-      this._clearHealth(id);
-      if (runtime.dafeiyuReleaseTimer) clearTimeout(runtime.dafeiyuReleaseTimer);
-      if (runtime.pending?.controller) runtime.pending.controller.abort();
-      if (runtime.autoAbort) runtime.autoAbort.abort();
-      if (match) this._cancelDafeiyuSpeech(match);
-      if (runtime.dafeiyu) {
-        void runtime.dafeiyu.client.leave({
-          sessionId: runtime.dafeiyu.sessionId,
-          matchId: id,
-        }).catch(() => {});
+      this.cancelViewerRelease(id);
+      runtime.pending?.controller?.abort();
+      if (match && (runtime.dafeiyu || runtime.dafeiyuConnection)) {
+        disconnects.push(this._disconnectDafeiyuSession(match, { markOff: true }));
       }
     }
+    await Promise.allSettled(disconnects);
   }
 }
 

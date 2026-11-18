@@ -6,6 +6,7 @@ import {
   testModelConnection,
   requestModelCompletion,
   validateModelConfig,
+  reasoningRequestFields,
 } from '../packages/models/index.mjs';
 import gomokuGame from '../packages/games/gomoku/index.mjs';
 import { createMockOpenAI } from './helpers/mock-openai.mjs';
@@ -51,9 +52,53 @@ test('模型配置字段校验；无 Key 合法', () => {
   });
   assert.equal(valid.ok, true);
   assert.equal(valid.value.apiKey, '');
+  assert.equal(valid.value.reasoningEffort, 'default');
+  assert.equal(valid.value.maxOutputTokens, 4800);
+  const custom = validateModelConfig({
+    name: '推理模型',
+    provider: 'openai-compatible',
+    baseUrl: 'https://api.deepseek.com',
+    modelId: 'deepseek-flash',
+    reasoningEffort: 'low',
+    maxOutputTokens: 32768,
+  });
+  assert.equal(custom.ok, true);
+  assert.equal(custom.value.reasoningEffort, 'low');
+  assert.equal(custom.value.maxOutputTokens, 32768);
+  const invalidReasoning = validateModelConfig({
+    name: '推理模型',
+    baseUrl: 'https://api.deepseek.com',
+    modelId: 'deepseek-flash',
+    reasoningEffort: 'turbo',
+    maxOutputTokens: 999999,
+  });
+  assert.equal(invalidReasoning.ok, false);
+  assert.ok(invalidReasoning.errors.some((item) => item.includes('推理强度')));
+  assert.ok(invalidReasoning.errors.some((item) => item.includes('输出上限')));
   const invalid = validateModelConfig({ name: '', baseUrl: 'nope', modelId: '' });
   assert.equal(invalid.ok, false);
   assert.ok(invalid.errors.length >= 3);
+});
+
+test('推理强度只为 DeepSeek 映射 thinking / reasoning_effort', () => {
+  const endpoint = 'https://api.deepseek.com/v1/chat/completions';
+  assert.deepEqual(reasoningRequestFields({ reasoningEffort: 'default' }, endpoint), {});
+  assert.deepEqual(reasoningRequestFields({ reasoningEffort: 'off' }, endpoint), {
+    thinking: { type: 'disabled' },
+  });
+  assert.deepEqual(reasoningRequestFields({ reasoningEffort: 'low' }, endpoint), {
+    thinking: { type: 'enabled' },
+    reasoning_effort: 'low',
+  });
+  assert.deepEqual(reasoningRequestFields({ reasoningEffort: 'max' }, endpoint), {
+    thinking: { type: 'enabled' },
+    reasoning_effort: 'max',
+  });
+  assert.deepEqual(
+    reasoningRequestFields({ reasoningEffort: 'high' }, 'http://127.0.0.1:18200/v1/chat/completions'),
+    {},
+    '本地兼容服务不应收到 DeepSeek 专属字段',
+  );
 });
 
 test('连接测试成功；有 Key 时发送 Bearer local，无 Key 时不发 Authorization', async () => {
@@ -77,6 +122,38 @@ test('连接测试成功；有 Key 时发送 Bearer local，无 Key 时不发 Au
   } finally {
     await noKey.close();
   }
+});
+
+test('连接测试不把只有 HTTP 成功的空正文当成模型可用', async () => {
+  const mock = await createMockOpenAI({
+    responder: () => ({ content: null, finishReason: 'length' }),
+  });
+  try {
+    const result = await testModelConnection(modelFor(mock));
+    assert.equal(result.ok, false);
+    assert.equal(result.error.stage, 'response');
+    assert.match(result.error.message, /达到上限/);
+  } finally {
+    await mock.close();
+  }
+});
+
+test('推理输出耗尽小额测试预算时连接成功且显示正文未完成', async () => {
+  const mock = await createMockOpenAI({
+    responder: () => ({ httpStatus: 200, body: {
+      choices: [{ message: { role: 'assistant', content: null, reasoning_content: 'fixture-reasoning' }, finish_reason: 'length' }],
+      usage: { prompt_tokens: 23, completion_tokens: 128, completion_tokens_details: { reasoning_tokens: 128 } },
+    } }),
+  });
+  try {
+    const result = await testModelConnection(modelFor(mock));
+    assert.equal(result.ok, true);
+    assert.match(result.warning, /思考阶段/);
+    assert.match(result.checks.at(-1).detail, /正文未完成/);
+    assert.equal(JSON.stringify(result).includes('fixture-reasoning'), false);
+    assert.equal(mock.requests[0].body.reasoning_effort, undefined);
+    assert.equal(mock.requests[0].body.chat_template_kwargs, undefined);
+  } finally { await mock.close(); }
 });
 
 test('认证失败和模型不存在被明确区分，且错误不泄露 Key', async () => {

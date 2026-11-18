@@ -18,6 +18,7 @@
 ```powershell
 $patchRoot = "D:\path\to\AI-Arena\integrations\dafeiyu-v0.3.1-arena-bridge"
 Copy-Item "$patchRoot\bridge\arena_routes.py" ".\bridge\arena_routes.py" -Force
+Copy-Item "$patchRoot\bridge\inference.py" ".\bridge\inference.py" -Force
 Copy-Item "$patchRoot\bridge\games\arena.py" ".\bridge\games\arena.py" -Force
 Copy-Item "$patchRoot\bridge\presentation.py" ".\bridge\presentation.py" -Force
 git apply "$patchRoot\runtime\routes.patch"

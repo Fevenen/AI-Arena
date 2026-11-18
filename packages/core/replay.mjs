@@ -7,7 +7,7 @@ import { RuleError } from './errors.mjs';
  */
 export function buildReplay({ game, match, limit = null }) {
   const actions = Array.isArray(match.actions) ? match.actions : [];
-  let state = game.createInitialState({ seed: match.seed ?? null });
+  let state = game.createInitialState({ seed: match.seed ?? null, seatIds: match.seatOrder });
   const steps = [
     {
       step: 0,
@@ -48,6 +48,7 @@ export function buildReplay({ game, match, limit = null }) {
       gameName: match.gameName,
       rulesVersion: match.rulesVersion,
       status: match.status,
+      aiPace: match.aiPace ?? 'quality',
       createdAt: match.createdAt,
       startedAt: match.startedAt,
       finishedAt: match.finishedAt,

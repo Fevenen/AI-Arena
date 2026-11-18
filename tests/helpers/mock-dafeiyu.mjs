@@ -175,6 +175,7 @@ export async function createMockDafeiyu(options = {}) {
     }
     if (op === 'speak') {
       if (body.key) state.speechKeys.push(body.key);
+      if (options.speakDelayMs) await new Promise((resolve) => setTimeout(resolve, options.speakDelayMs));
       send(200, { ok: true, voiceStatus: state.speakStatus });
       return;
     }

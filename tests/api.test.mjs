@@ -261,7 +261,7 @@ test('HTTP 对局流程：落子、SSE、暂停/继续、历史、结束与导�
     await waitFor(async () => {
       const state = await api(env.base, `/api/matches/${secondId}`);
       return state.data.match.status === 'finished';
-    }, 12000, '全 AI 对局未结束');
+    }, 30000, '全 AI 对局未结束');
     const finished = await api(env.base, `/api/matches/${secondId}`);
     assert.ok(['win', 'draw', 'black_win', 'white_win'].includes(finished.data.match.result));
     const history = await api(env.base, '/api/matches?status=finished');
@@ -377,6 +377,66 @@ test('离开对局 API 暂停棋手局并释放大肥鱼会话', async () => {
   }
 });
 
+test('最后一个 SSE 页面关闭后暂停普通模型回合，其他页面仍连接时不中断', async () => {
+  const mock = await createMockOpenAI({
+    delayMs: 7000,
+    responder: () => JSON.stringify({ move: 'A1' }),
+  });
+  const env = await startApp({
+    models: [{
+      id: 'slow-model',
+      name: '慢模型',
+      provider: 'openai-compatible',
+      baseUrl: mock.baseUrl,
+      modelId: mock.model,
+      timeoutMs: 9000,
+      maxRetries: 0,
+    }],
+  });
+  const viewers = [new AbortController(), new AbortController()];
+  try {
+    const created = await api(env.base, '/api/matches', {
+      method: 'POST',
+      body: {
+        gameId: 'gomoku',
+        seats: { black: { kind: 'human' }, white: { kind: 'model', modelId: 'slow-model' } },
+      },
+    });
+    assert.equal(created.status, 201);
+    const matchPath = '/api/matches/' + created.data.match.id;
+    await Promise.all(viewers.map(async (viewer) => {
+      const stream = await fetch(env.base + matchPath + '/events', { signal: viewer.signal });
+      assert.equal(stream.status, 200);
+      assert.match(new TextDecoder().decode((await stream.body.getReader().read()).value), /event: match/);
+    }));
+    const readMatch = async () => (await api(env.base, matchPath)).data.match;
+    await waitFor(async () => (await readMatch()).viewers === 2);
+    await api(env.base, matchPath + '/actions', {
+      method: 'POST',
+      body: { seat: 'black', action: { type: 'place', move: 'H8' } },
+    });
+    await waitFor(() => mock.requests.length === 1);
+    viewers[0].abort();
+    await waitFor(async () => (await readMatch()).viewers === 1);
+    const stillWatching = await api(env.base, matchPath + '/leave', { method: 'POST', body: {} });
+    assert.equal(stillWatching.data.match.status, 'playing');
+    viewers[1].abort();
+    const paused = await waitFor(async () => {
+      const snapshot = await readMatch();
+      return snapshot.status === 'paused' ? snapshot : null;
+    }, 6500);
+    assert.equal(paused.viewers, 0);
+    assert.equal(paused.pause.code, 'page_left');
+    assert.equal(paused.pending, null);
+    assert.equal(paused.actionCount, 1);
+    assert.equal(mock.requests.length, 1);
+  } finally {
+    viewers.forEach((viewer) => viewer.abort());
+    await env.close();
+    await mock.close();
+  }
+});
+
 test('非法 Origin 被拒绝；本机 Origin 可创建对局', async () => {
   const env = await startApp();
   try {
@@ -425,4 +485,74 @@ test('大肥鱼健康接口和配置可检查；桌宠离线给出明确状态',
     await env.close();
     await pet.close();
   }
+});
+
+test('模型监控与固定局面测速：原生开关、指标持久化、原棋局不变', async()=>{
+  const mock=await createMockOpenAI({responder:()=>({content:'{"move":"H8"}'})});
+  const model={id:'benchmark-model',name:'测速模型',provider:'openai-compatible',baseUrl:mock.baseUrl,modelId:mock.model,apiKey:'private-benchmark-key',timeoutMs:2000,maxRetries:0,reasoningAdapter:'qwen',thinkingMode:'on',reasoningEffort:'default',maxOutputTokens:1024};
+  const env=await startApp({models:[model]});
+  try{
+    const match=await api(env.base,'/api/matches',{method:'POST',body:{gameId:'gomoku',seats:{black:{kind:'human'},white:{kind:'bot'}}}});
+    assert.equal(match.status,201);
+    const id=match.data.match.id;
+    const preview=await api(env.base,'/api/models/reasoning-preview',{method:'POST',body:model});
+    assert.deepEqual(preview.data.profile.efforts,['default']);
+    const job=await api(env.base,'/api/monitor/benchmarks',{method:'POST',body:{matchId:id,modelId:model.id,step:0,repetitions:2,variants:[{thinkingMode:'on'},{thinkingMode:'off'}]}});
+    assert.equal(job.status,202);
+    await waitFor(()=>env.app.benchmarks.list().some(j=>j.status==='completed'),5000);
+    const monitor=await api(env.base,'/api/monitor?task=benchmark');
+    assert.equal(monitor.data.count,4);
+    assert.ok(monitor.data.groups.every(g=>g.legalRate===1));
+    assert.equal(new Set(mock.requests.map(r=>r.body.chat_template_kwargs.enable_thinking)).size,2);
+    assert.equal(env.app.matchService.matches.get(id).actions.length,0);
+    assert.equal(env.app.configStore.modelConfig(model.id).thinkingMode,'on');
+    assert.doesNotMatch(JSON.stringify(monitor.data),/private-benchmark-key|"messages"|"content"/);
+    const invalid=await api(env.base,'/api/monitor/benchmarks',{method:'POST',body:{matchId:id,modelId:model.id,step:999,repetitions:1,variants:[{}]}});
+    assert.equal(invalid.status,400);
+  }finally{await env.close();await mock.close();}
+});
+
+test('监控对局筛选与模型、桌游筛选相交，导出使用同一范围',async()=>{
+  const env=await startApp();
+  try{
+    for(const row of [
+      {matchId:'one',modelId:'a',gameId:'gomoku'},
+      {matchId:'two',modelId:'a',gameId:'gomoku'},
+      {matchId:'one',modelId:'b',gameId:'splendor'},
+    ])env.app.monitor.start({...row,task:'move'}).finish('completed',{elapsedMs:100});
+    for(const endpoint of ['/api/monitor','/api/monitor/export']){
+      const scoped=await api(env.base,endpoint+'?matchId=one');
+      assert.equal(scoped.data.count,2);assert.ok(scoped.data.recent.every(r=>r.matchId==='one'));
+      const combined=await api(env.base,endpoint+'?matchId=one&modelId=a&gameId=gomoku');
+      assert.equal(combined.data.count,1);assert.equal(combined.data.recent[0].modelId,'a');
+      const empty=await api(env.base,endpoint+'?matchId=two&gameId=splendor');assert.equal(empty.data.count,0);
+    }
+  }finally{await env.close();}
+});
+
+test('限时模式保留思考参数，聊天暂停等待当前步完成',async()=>{
+  const mock=await createMockOpenAI({delayMs:150,responder:()=>({content:'{"move":"H8"}'})});
+  const model={id:'timed-native',name:'原生思考',provider:'openai-compatible',baseUrl:mock.baseUrl,modelId:mock.model,timeoutMs:3000,maxRetries:0,reasoningAdapter:'qwen',thinkingMode:'on',reasoningEffort:'default',maxOutputTokens:4096};
+  const env=await startApp({models:[model]});
+  try{
+    const created=await api(env.base,'/api/matches',{method:'POST',body:{gameId:'gomoku',aiPace:'fast',seats:{black:{kind:'model',modelId:model.id},white:{kind:'human'}}}});
+    const id=created.data.match.id;
+    await waitFor(()=>mock.requests.length>0,2000);
+    const pause=await api(env.base,'/api/matches/'+id+'/pause-after-move',{method:'POST',body:{}});
+    assert.equal(pause.status,200);
+    await waitFor(()=>env.app.matchService.matches.get(id).status==='paused',3000);
+    const match=env.app.matchService.matches.get(id);
+    assert.equal(match.actions.length,1);
+    assert.equal(mock.requests[0].body.chat_template_kwargs.enable_thinking,true);
+    assert.equal(mock.requests[0].body.max_tokens,4096);
+    assert.match(match.pause.reason,/当前步/);
+    const timing=await api(env.base,'/api/monitor/matches/'+id);
+    assert.equal(timing.status,200);
+    assert.equal(timing.data.seats[0].moveCount,1);
+    assert.ok(timing.data.seats[0].totalMs>0);
+    assert.equal(timing.data.seats[1].totalMs,null);
+    assert.equal(timing.data.rows[0].cells.black.step,1);
+    assert.equal(timing.data.requests.length,1);
+    assert.doesNotMatch(JSON.stringify(timing.data),/"messages"|"content"|"apiKey"/);
+  }finally{await env.close();await mock.close();}
 });

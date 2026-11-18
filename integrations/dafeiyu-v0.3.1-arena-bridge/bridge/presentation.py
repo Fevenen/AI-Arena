@@ -12,6 +12,7 @@ from collections import OrderedDict
 from .speech import to_speech
 
 _current_valid = ContextVar('speech_valid', default=None)
+_current_key = ContextVar('speech_key', default='')
 
 
 class ObsoleteSpeech(Exception):
@@ -63,6 +64,7 @@ class SpeechQueue:
             job = await self.queue.get()
             path = None
             token = _current_valid.set(job['valid'])
+            key_token = _current_key.set(job['key'])
             try:
                 path = await job["audio"]
                 if job['valid'] and not job['valid']():
@@ -79,6 +81,7 @@ class SpeechQueue:
                 job["status"] = "failed"
             finally:
                 _current_valid.reset(token)
+                _current_key.reset(key_token)
                 if path:
                     self.remove(path)
                 self.queue.task_done()
@@ -156,9 +159,17 @@ async def enqueue(handler, text, key, valid=None, target_uid=None):
                 clone = copy.copy(_ctx)
                 clone.tts_engine = CachedEngine(path)
                 manager = TTSTaskManager()
+                send = _ws.send_text
+                if _current_key.get().startswith('screen-'):
+                    async def send(payload):
+                        message = json.loads(payload)
+                        if message.get('type') == 'audio' and guard and guard():
+                            await _ws.send_text(json.dumps({**message, 'screen_comment': True}))
+                        elif message.get('type') == 'backend-synth-complete':
+                            await _ws.send_text(payload)
                 try:
                     await asyncio.wait_for(
-                        _speak_forced(clone, _ws.send_text, manager, _uid, text),
+                        _speak_forced(clone, send, manager, _uid, text),
                         timeout=180,
                     )
                 finally:
@@ -179,7 +190,7 @@ async def cancel(handler):
         await ws.send_text(json.dumps({"type": "interrupt-signal"}))
 
 
-def cancel_jobs(handler, prefix):
+def cancel_jobs(handler, prefix, target_uid=None):
     """Cancel queued Arena speech belonging to one bridge session.
 
     Waiting jobs are marked cancelled and made invalid before playback. A job
@@ -189,7 +200,9 @@ def cancel_jobs(handler, prefix):
     if not prefix:
         return 0
     cancelled = 0
-    for queue in getattr(handler, "_speech_queues", {}).values():
+    for uid, queue in getattr(handler, "_speech_queues", {}).items():
+        if target_uid is not None and uid != target_uid:
+            continue
         for key, job in list(queue.jobs.items()):
             if not isinstance(key, str) or not key.startswith(prefix):
                 continue

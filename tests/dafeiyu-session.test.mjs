@@ -50,6 +50,7 @@ test('离开棋手对局会释放会话并暂停，重连后可继续', async ()
   try {
     const id = await connectedMatch(harness, { seat: true });
     assert.equal(mock.state.sessions.size, 1);
+    harness.unsubscribe(id);
     const left = await harness.service.leaveMatch(id, { reason: '页面切换测试' });
     assert.equal(left.status, 'paused');
     assert.equal(left.pause.code, 'page_left');
@@ -69,7 +70,7 @@ test('离开棋手对局会释放会话并暂停，重连后可继续', async ()
 });
 
 test('关闭语音会取消桌宠里仍在等待的 Arena 播报', async () => {
-  const mock = await createMockDafeiyu({ speakStatus: 'queued' });
+  const mock = await createMockDafeiyu({ speakStatus: 'queued', speakDelayMs: 150 });
   const harness = await createServiceHarness({ dafeiyuUrl: mock.url });
   try {
     const id = await connectedMatch(harness, { voice: true });
@@ -91,6 +92,8 @@ test('关闭语音会取消桌宠里仍在等待的 Arena 播报', async () => {
       message: '关闭语音没有取消旧播报',
     });
     assert.ok(mock.state.speechCancelled >= 1);
+    // The delayed queue confirmation must not overwrite the cancel status.
+    await new Promise((resolve) => setTimeout(resolve, 170));
     const answer = harness.service.getMatch(id).chat.find((chat) => chat.kind === 'answer');
     assert.equal(answer.voiceStatus, 'cancelled');
   } finally {
@@ -111,6 +114,7 @@ test('离开/断开时迟到的问答不会回写旧局聊天', async () => {
       timeoutMs: 2000,
       message: '问答没有进入等待',
     });
+    harness.unsubscribe(id);
     await harness.service.leaveMatch(id, { reason: '旧局离开' });
     const asked = await asking;
     assert.equal(asked.ok, false);

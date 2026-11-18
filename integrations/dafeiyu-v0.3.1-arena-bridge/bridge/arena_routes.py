@@ -4,6 +4,7 @@
 Loopback Origin。竞技场负责棋盘与回合；本模块不直接执行任何落子。
 """
 
+import asyncio
 import hmac
 from urllib.parse import urlsplit
 
@@ -12,6 +13,7 @@ from starlette.responses import JSONResponse
 
 from . import settings
 from .games.arena import ArenaError, build_service
+from . import inference
 
 LOCAL_HOSTS = ('127.0.0.1', '::1', 'localhost', 'testclient')
 LOOPBACK_NAMES = ('127.0.0.1', '::1', 'localhost')
@@ -74,6 +76,27 @@ def build_router(handler, service=None):
     def payload_dict(request, payload):
         return payload if isinstance(payload, dict) else {}
 
+    async def while_connected(request, operation):
+        task = asyncio.create_task(operation)
+        try:
+            while not task.done():
+                if await request.is_disconnected():
+                    raise ArenaError(499, '请求已取消。', code='cancelled')
+                await asyncio.wait({task}, timeout=0.2)
+            return task.result()
+        finally:
+            if not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
+    @router.get('/model-monitor')
+    async def model_monitor(request: Request):
+        try:
+            credentials(request)
+            return {'ok': True, 'records': inference.snapshot()}
+        except ArenaError as exc:
+            return JSONResponse({'ok': False, 'error': {'code': 'forbidden', 'message': exc.message}}, status_code=exc.status)
+
     @router.post('/{operation}')
     async def dispatch(operation: str, request: Request, payload: dict):
         try:
@@ -84,23 +107,23 @@ def build_router(handler, service=None):
             elif operation == 'status':
                 result = game.status(body.get('sessionId'), origin, body.get('matchId'))
             elif operation == 'comment':
-                result = await game.comment(
+                result = await while_connected(request, game.comment(
                     body.get('sessionId'), origin, body.get('matchId'),
                     body.get('role'), body.get('seat'), body.get('snapshot'),
                     body.get('event'), body.get('mode', 'auto'),
-                )
+                ))
             elif operation == 'question':
-                result = await game.question(
+                result = await while_connected(request, game.question(
                     body.get('sessionId'), origin, body.get('matchId'),
                     body.get('role'), body.get('seat'), body.get('snapshot'),
                     body.get('question'),
-                )
+                ))
             elif operation == 'move':
-                result = await game.move(
+                result = await while_connected(request, game.move(
                     body.get('sessionId'), origin, body.get('matchId'),
                     body.get('seat'), body.get('snapshot'),
                     body.get('feedback', ''), body.get('requestId', ''),
-                )
+                ))
             elif operation == 'speak':
                 result = await game.speak(
                     body.get('sessionId'), origin, body.get('matchId'),

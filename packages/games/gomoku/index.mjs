@@ -172,7 +172,7 @@ function getOutcome(state) {
   return state.outcome;
 }
 
-function describeForModel({ state, seatId, recentActions = [] }) {
+function describeForModel({ state, seatId, recentActions = [], allowSpeech = false }) {
   return {
     gameName: '自由五子棋',
     rulesText: RULES_TEXT,
@@ -184,7 +184,9 @@ function describeForModel({ state, seatId, recentActions = [] }) {
     coordinateSystem: COORDINATE_SYSTEM,
     lastMove: state.lastMove,
     recentActions,
-    responseFormat: '{"move":"H8","say":"可选的一句公开想法，30字以内"}',
+    responseFormat: allowSpeech
+      ? '{"move":"H8","say":"可选的一句公开想法，30字以内"}'
+      : '{"move":"H8"}',
     forbidden: '无禁手；长连（超过五子）同样获胜。',
   };
 }

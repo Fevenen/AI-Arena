@@ -1,3 +1,4 @@
+import { describeReasoning } from '../../packages/models/reasoning.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -138,6 +139,11 @@ export class ConfigStore {
       modelId: model.modelId,
       timeoutMs: model.timeoutMs,
       maxRetries: model.maxRetries ?? this.config.match.maxModelRetries,
+      reasoningEffort: model.reasoningEffort ?? 'default',
+      thinkingMode: model.thinkingMode ?? 'default',
+      reasoningAdapter: model.reasoningAdapter ?? 'auto',
+      reasoning: describeReasoning(model),
+      maxOutputTokens: model.maxOutputTokens ?? 4800,
       hasApiKey: Boolean(model.apiKey),
       isExample: Boolean(model.isExample),
       endpoint,
@@ -189,6 +195,8 @@ export class ConfigStore {
       provider: input.provider ?? previous.provider,
       timeoutMs: input.timeoutMs ?? previous.timeoutMs,
       maxRetries: input.maxRetries ?? previous.maxRetries,
+      reasoningEffort: input.reasoningEffort ?? previous.reasoningEffort ?? 'default',
+      maxOutputTokens: input.maxOutputTokens ?? previous.maxOutputTokens ?? 4800,
     };
     // 未提交 apiKey 表示保留原 Key；显式传空字符串表示清除。
     if (!Object.prototype.hasOwnProperty.call(input, 'apiKey')) {
@@ -247,6 +255,10 @@ export class ConfigStore {
       configured: online,
       autoCommentByDefault: Boolean(settings.autoCommentByDefault ?? true),
       voiceByDefault: Boolean(settings.voiceByDefault ?? false),
+      moveThinkingMode: settings.moveThinkingMode ?? 'off',
+      moveReasoningAdapter: settings.moveReasoningAdapter ?? 'qwen',
+      moveReasoningEffort: settings.moveReasoningEffort ?? 'default',
+      moveMaxOutputTokens: settings.moveMaxOutputTokens ?? 8192,
     };
   }
 
@@ -291,6 +303,23 @@ export class ConfigStore {
         throw error;
       }
       next.timeoutMs = timeout;
+    }
+    if(input.moveThinkingMode != null) {
+      if(!['default','on','off'].includes(input.moveThinkingMode)) throw Object.assign(new Error('无效的棋手思考开关'),{status:400,code:'invalid_thinking'});
+      next.moveThinkingMode=input.moveThinkingMode;
+    }
+    if(input.moveReasoningAdapter != null){
+      if(!['qwen','kvmem'].includes(input.moveReasoningAdapter)) throw Object.assign(new Error('无效的桌宠推理协议'),{status:400,code:'invalid_thinking'});
+      next.moveReasoningAdapter=input.moveReasoningAdapter;
+    }
+    if(input.moveReasoningEffort != null){
+      if(!['default','low','medium','high'].includes(input.moveReasoningEffort)) throw Object.assign(new Error('无效的引擎推理强度'),{status:400,code:'invalid_thinking'});
+      next.moveReasoningEffort=input.moveReasoningEffort;
+    }
+    if(input.moveMaxOutputTokens != null){
+      const budget=Number(input.moveMaxOutputTokens);
+      if(!Number.isInteger(budget)||budget<256||budget>32768) throw Object.assign(new Error('棋手输出预算必须为256–32768'),{status:400,code:'invalid_thinking'});
+      next.moveMaxOutputTokens=budget;
     }
     this.config.dafeiyu = next;
     this.save();

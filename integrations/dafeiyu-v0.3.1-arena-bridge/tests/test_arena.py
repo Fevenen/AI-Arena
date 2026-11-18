@@ -170,6 +170,79 @@ class ArenaServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.model.calls[2]['data']['seat'], 'star')
         self.assertFalse(self.speak.calls)
 
+    async def test_nonhuman_opponent_is_distinct_from_owner_in_all_requests(self):
+        self.model.responses = ['我赢了二号位机器人。', '主人在观战，我的对手是机器人。', '{"move":"H8"}']
+        board = snapshot(outcome={'type': 'win', 'winnerSeat': 'black'})
+        board['seats'] = [
+            {'id': 'black', 'name': '黑方', 'kind': 'dafeiyu', 'participantName': '大肥鱼'},
+            {'id': 'white', 'name': '白方', 'kind': 'bot', 'participantName': '内置机器人'},
+        ]
+        await self.service.comment(self.session, ORIGIN, MATCH, 'player', 'black', board,
+                                   {'key': 'identity-end', 'type': 'game_end'})
+        await self.service.question(self.session, ORIGIN, MATCH, 'player', 'black', board, '你赢了谁？')
+        await self.service.move(self.session, ORIGIN, MATCH, 'black', board)
+        for call in self.model.calls:
+            self.assertIn('白方由内置机器人控制', call['prompt'])
+            self.assertIn('主人只在场外观战', call['prompt'])
+            self.assertIn('角色称呼服从这份参赛名单', call['prompt'])
+
+    async def test_human_model_and_legacy_rosters_have_explicit_identity(self):
+        self.model.responses = ['测试回答'] * 3
+        board = snapshot()
+        board['seats'][0]['kind'] = 'human'
+        board['seats'][1].update(kind='model', participantName='测试模型')
+        await self.service.question(self.session, ORIGIN, MATCH, 'observer', None, board, '谁在下？')
+        prompt = self.model.calls[-1]['prompt']
+        self.assertIn('真人座位是黑方', prompt)
+        self.assertIn('白方由普通模型控制，名称为测试模型', prompt)
+        board['seats'] = {'black': {'name': '黑方', 'kind': 'human'}}
+        await self.service.question(self.session, ORIGIN, MATCH, 'observer', None, board, '谁在下？')
+        self.assertIn('真人座位是黑方', self.model.calls[-1]['prompt'])
+        await self.service.question(self.session, ORIGIN, MATCH, 'observer', None, snapshot(), '谁在下？')
+        self.assertIn('主人的参赛身份未知', self.model.calls[-1]['prompt'])
+
+    async def test_repeated_comment_is_skipped_without_poisoning_history(self):
+        text = '我先补上蓝色折扣，下回合看看那张两分牌。'
+        self.model.responses = ['（甩尾巴）' + text, '（轻轻甩尾）' + text]
+        board = snapshot()
+        board['recentChat'] = [{'role': 'dafeiyu', 'kind': 'comment', 'text': '旧的六分卡说法'}]
+        await self.service.comment(self.session, ORIGIN, MATCH, 'player', 'black', board, {'key': 'one'})
+        with self.assertRaises(ArenaError) as repeated:
+            await self.service.comment(self.session, ORIGIN, MATCH, 'player', 'black', board, {'key': 'two'})
+        self.assertEqual(repeated.exception.code, 'comment_skipped')
+        self.assertEqual(self.model.calls[0]['data']['snapshot']['recentChat'], [])
+        self.assertNotIn('_previousSpeech', self.model.calls[0]['data'])
+
+    async def test_card_points_and_actor_are_checked_before_comment_is_displayed(self):
+        board = snapshot()
+        board['state']['players'] = {'black': {'points': 0}, 'white': {'points': 2}}
+        event = {'key': 'purchase', 'details': {'actor': 'black', 'card': {'id': '1G6', 'points': 0},
+                                               'scoreAfter': 0, 'pointsGained': 0}}
+        self.model.responses = ['本鲸刚拿下这张 6 分卡，真划算。', '本鲸稳稳领先！']
+        for key in ('card', 'leader'):
+            with self.assertRaises(ArenaError) as invalid:
+                await self.service.comment(self.session, ORIGIN, MATCH, 'player', 'black', board, {**event, 'key': key})
+            self.assertEqual(invalid.exception.code, 'comment_skipped')
+        self.model.responses = ['本鲸刚买下这张卡。']
+        with self.assertRaises(ArenaError) as observer:
+            await self.service.comment(self.session, ORIGIN, MATCH, 'observer', None, board, event)
+        self.assertEqual(observer.exception.code, 'comment_skipped')
+
+    async def test_question_corrects_identity_once_and_move_keeps_action_when_speech_repeats(self):
+        board = snapshot()
+        board['seats'] = [
+            {'id': 'black', 'name': '黑方', 'kind': 'dafeiyu'},
+            {'id': 'white', 'name': '白方', 'kind': 'model', 'participantName': 'DS'},
+        ]
+        self.model.responses = ['仆人你那点分不够看。', '主人，我的对手是白方 DS。']
+        result = await self.service.question(self.session, ORIGIN, MATCH, 'player', 'black', board, '我在下棋吗？')
+        self.assertIn('白方 DS', result['text'])
+        self.assertIn('correction', self.model.calls[-1]['data'])
+        self.model.responses = ['{"move":"H8","say":"（尾巴甩）本鲸就选这个，别挡路～"}']
+        result = await self.service.move(self.session, ORIGIN, MATCH, 'black', board)
+        import json
+        self.assertEqual(json.loads(result['raw']), {'move': 'H8', 'say': ''})
+
     async def test_voice_uses_current_validity_dedup_key_and_cancel(self):
         result = await self.service.speak(self.session, ORIGIN, MATCH, '我先堵右边。', 'evt/1')
         self.assertEqual(result['voiceStatus'], 'queued')

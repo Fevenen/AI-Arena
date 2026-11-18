@@ -1,0 +1,69 @@
+.splendor-surface { padding: clamp(10px, 2vw, 20px); display: grid; gap: 12px; min-width: 0; }
+.spl-heading { display: flex; justify-content: space-between; gap: 8px; align-items: center; }
+.spl-heading strong { font-size: 1.2em; color: var(--gold); }
+.spl-heading p, .spl-tier small { margin: 2px 0 0; color: var(--muted); }
+.spl-players { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(125px, 100%), 1fr)); gap: 6px; }
+.spl-player,.spl-deck,.spl-card,.spl-noble,.spl-bank,.spl-actions { padding: 8px; border: 1px solid var(--line-soft); border-radius: 8px; background: rgba(8,18,25,.5); min-width: 0; }
+.spl-player { font-size: .81em; }
+.spl-player.active { border-color: var(--gold); }
+.spl-bank,.spl-actions { display: flex; flex-wrap: wrap; gap: 5px; align-items: center; }
+.spl-token { display: inline-flex; border-radius: 999px; font-weight: 700; min-width: 25px; padding: 2px 5px; margin-block: 2px; justify-content: center; font-size: .8rem; }
+.spl-W { background: #ece4d9; color: #26221d; }.spl-U { background: #8fbdf3; color: #102b55; }
+.spl-G { background: #92d4aa; color: #123623; }.spl-R { background: #efa7a7; color: #4c1818; }
+.spl-B { background: #434252; color: #fff; }.spl-Y { background: #f2ce81; color: #402b09; }
+.spl-nobles,.spl-tier { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 6px; }
+.spl-card { display: grid; grid-template-rows: auto 1fr auto; min-height: 90px; }
+.spl-card header { display: flex; align-items: center; flex-wrap: wrap; gap: 3px 6px; }
+.spl-card footer { display: flex; gap: 3px; flex-wrap: wrap; }
+.spl-noble { font-size: .75em; }
+.spl-deck { display: grid; align-content: center; gap: 5px; }
+.spl-reserved > div { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; }
+.spl-actions > div { display: flex; flex-wrap: wrap; gap: 4px; }
+@media(max-width: 700px) { .spl-nobles,.spl-tier { grid-template-columns: repeat(2, minmax(0, 1fr)); } .spl-deck { grid-column: 1 / -1; grid-template-columns: auto 1fr auto; align-items: center; } }
+
+
+/* Visual hierarchy on the table */
+.splendor-surface { gap: 14px; }
+.spl-heading { padding-bottom: 12px; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+.spl-heading strong { font-size: 20px; font-weight: 700; color: var(--text); }
+.spl-heading > span { font-size: 12px; color: var(--accent-strong); }
+.spl-players { gap: 8px; }
+.spl-player,.spl-deck,.spl-card,.spl-noble,.spl-bank,.spl-actions {
+  padding: 9px;
+  border-color: var(--line);
+  background: var(--bg-deep);
+}
+.spl-player { font-size: 12px; color: var(--text-soft); }
+.spl-player > small { color: var(--muted); }
+.spl-player.active { background: #302925; border-color: var(--accent); }
+.spl-bank,.spl-actions { gap: 7px; }
+.spl-bank strong,.spl-actions strong { font-size: 13px; }
+.spl-token { border: 1px solid #ffffff48; font-size: 12px; }
+.spl-market { display: grid; gap: 10px; min-width: 0; }
+.spl-market h3,.spl-noble-area h3 { margin: 0; font-size: 15px; }
+.spl-noble-area { display: grid; gap: 7px; }
+.spl-noble strong { font-size: 12px; }
+.spl-deck { border-style: dashed; }
+.spl-card { border-top: 3px solid var(--gem-edge, var(--line-strong)); }
+.spl-card[data-bonus="W"] { --gem-edge: #ece4d9; }
+.spl-card[data-bonus="U"] { --gem-edge: #8fbdf3; }
+.spl-card[data-bonus="G"] { --gem-edge: #92d4aa; }
+.spl-card[data-bonus="R"] { --gem-edge: #efa7a7; }
+.spl-card[data-bonus="B"] { --gem-edge: #7a79a7; }
+.spl-card header small { color: var(--muted-2); font-size: 10px; }
+.spl-card footer { align-items: center; }
+.spl-card footer input { max-width: 100%; width: 100%; }
+.spl-card footer .btn,.spl-deck .btn { padding-inline: 6px; white-space: normal; }
+.spl-actions { align-items: flex-start; flex-direction: column; }
+.spl-actions button,.spl-card button,.spl-deck button { border-color: var(--line); background: var(--panel-soft); }
+@media (max-width: 620px) {
+  .splendor-surface .btn,.spl-actions button,.spl-card button { min-height: 36px; }
+}
+.spl-reservations {display:grid;gap:9px;min-width:0;}
+.spl-reservations h3,.spl-reservations h4 {margin:0;}
+.spl-reserve-groups {display:grid;grid-template-columns:repeat(auto-fit,minmax(min(250px,100%),1fr));gap:12px;}
+.spl-reserve-group {min-width:0;border:1px solid var(--line);border-radius:10px;padding:12px;}
+.spl-reserve-group h4 {font-size:12px;margin-bottom:10px;color:var(--text-soft);overflow-wrap:anywhere;}
+.spl-reserve-cards {display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:6px;}
+.spl-card-back {border-style:dashed;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:6px;color:var(--muted);text-align:center;background:repeating-linear-gradient(45deg,var(--panel),var(--panel) 8px,var(--panel-soft) 8px,var(--panel-soft) 16px);}
+.spl-card-back strong {font-size:12px;}.spl-card-back span {font-size:11px;}

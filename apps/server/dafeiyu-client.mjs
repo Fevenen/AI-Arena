@@ -150,8 +150,8 @@ export class DafeiyuClient {
     return this.#request('question', { sessionId, matchId, role, seat, snapshot, question }, { signal });
   }
 
-  move({ sessionId, matchId, seat, snapshot, feedback = '', requestId = '', signal = null }) {
-    return this.#request('move', { sessionId, matchId, seat, snapshot, feedback, requestId }, { signal });
+  move({ sessionId, matchId, seat, snapshot, feedback = '', requestId = '', signal = null, timeoutMs = this.timeoutMs }) {
+    return this.#request('move', { sessionId, matchId, seat, snapshot, feedback, requestId }, { signal, timeoutMs: Math.min(timeoutMs, this.timeoutMs) });
   }
 
   speak({ sessionId, matchId, text, key }) {

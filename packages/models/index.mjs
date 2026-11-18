@@ -11,10 +11,16 @@ export {
   requestModelCompletion,
   describeModelEndpoint,
   providerFor,
+  REASONING_EFFORTS,
+  DEFAULT_MAX_OUTPUT_TOKENS,
+  MAX_OUTPUT_TOKENS_LIMIT,
 } from './client.mjs';
 export {
   normalizeBaseUrl,
   resolveChatEndpoint,
+  reasoningRequestFields,
   openAICompatibleProvider,
 } from './openai-compatible.mjs';
 export { BuiltInBot } from './bot.mjs';
+
+export { REASONING_PROFILES, reasoningAdapter, describeReasoning } from './reasoning.mjs';

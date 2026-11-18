@@ -1,3 +1,5 @@
+import { acquireLocalSlot } from './local-queue.mjs';
+import { describeReasoning } from './reasoning.mjs';
 import { ModelError, redactSecret, shorten } from './errors.mjs';
 
 function safeBaseUrl(value) {
@@ -47,6 +49,10 @@ export function resolveChatEndpoint(baseUrl) {
   }
   url.pathname = path;
   return url.toString();
+}
+
+export function reasoningRequestFields(config, endpoint) {
+  return describeReasoning({ ...config, baseUrl: config.baseUrl ?? endpoint }).sent;
 }
 
 export function buildHeaders(config) {
@@ -157,7 +163,65 @@ function networkError(error, config) {
   });
 }
 
-async function createCompletion(config, { messages, temperature = 0.2, maxTokens = 512, signal } = {}) {
+async function readCompletionStream(response, endpoint, started, headersMs, onProgress) {
+  const decoder = new TextDecoder();
+  let buffered = '', text = '', finishReason = null, usage = null;
+  let firstOutputMs = null, firstActionMs = null, firstAnswerMs = null;
+  function accept(line) {
+    const payload = line.trim();
+    if (!payload.startsWith('data:')) return;
+    const value = payload.slice(5).trim();
+    if (!value || value === '[DONE]') return;
+    let chunk;
+    try { chunk = JSON.parse(value); } catch { return; }
+    const choice = chunk.choices?.[0];
+    const content = choice?.delta?.content;
+    if (firstOutputMs == null && (content || choice?.delta?.reasoning_content)) firstOutputMs = Math.round(performance.now() - started);
+    if (choice?.delta?.reasoning_content) onProgress?.('thinking', { firstOutputMs });
+    if (content) {
+      firstAnswerMs ??= Math.round(performance.now() - started);
+      onProgress?.('answering', { firstOutputMs, firstAnswerMs });
+    }
+    if (typeof content === 'string') {
+      text += content;
+      if (firstActionMs == null && text.trim().endsWith('}')) {
+        try {
+          const result = JSON.parse(text);
+          if (result && !Array.isArray(result) && typeof result === 'object') firstActionMs = Math.round(performance.now() - started);
+        } catch {}
+      }
+    }
+    finishReason = choice?.finish_reason ?? finishReason;
+    usage = chunk.usage ?? usage;
+  }
+  for await (const bytes of response.body) {
+    buffered += decoder.decode(bytes, { stream: true });
+    const lines = buffered.split('\n');
+    buffered = lines.pop() ?? '';
+    for (const line of lines) accept(line);
+  }
+  accept(buffered + decoder.decode());
+  return { text, finishReason, endpoint, usage,
+    timing: { headersMs, firstOutputMs, firstAnswerMs, firstActionMs, totalMs: Math.round(performance.now() - started) } };
+}
+
+const serviceSnapshots=new Map();
+async function serviceDefault(config){
+  const url=new URL(config.baseUrl);
+  if(!['127.0.0.1','localhost','[::1]'].includes(url.hostname)||!['qwen','kvmem'].includes(describeReasoning(config).adapter))return null;
+  const cached=serviceSnapshots.get(url.origin);
+  if(cached && Date.now()-cached.at<3000)return cached.value;
+  let value=null;
+  try{const response=await fetch(url.origin+'/props',{signal:AbortSignal.timeout(400)});
+    if(response.ok){const data=await response.json();const effective=data.effective_settings?.effective;
+      if(effective)value={reasoningEffort:effective.reasoning_effort,reasoningBudgetTokens:effective.reasoning_budget_tokens,
+        source:data.effective_settings?.sources?.reasoning_effort??'service',observedAt:new Date().toISOString(),
+        templateReadsEffort:typeof data.chat_template==='string'?data.chat_template.includes('reasoning_effort'):null};}
+  }catch{}
+  serviceSnapshots.set(url.origin,{at:Date.now(),value});return value;
+}
+
+async function createCompletion(config, { messages, temperature = 0.2, maxTokens = 512, signal, probe = false, measureStream = false, onProgress = null, taskType = 'move' } = {}) {
   const endpoint = resolveChatEndpoint(config.baseUrl);
   const controller = new AbortController();
   let timedOut = false;
@@ -177,7 +241,21 @@ async function createCompletion(config, { messages, temperature = 0.2, maxTokens
   }
 
   let response;
+  let releaseSlot = () => {};
+  const started = performance.now();
   try {
+    const endpointHost = new URL(endpoint).hostname;
+    const reasoningFields = reasoningRequestFields(config, endpoint);
+    // Connection tests stay fast and deterministic even when the saved
+    // gameplay effort is low/high; actual move requests use the setting above.
+    if (probe && endpointHost === 'api.deepseek.com') {
+      reasoningFields.thinking = { type: 'disabled' };
+      delete reasoningFields.reasoning_effort;
+    }
+    const defaults=await serviceDefault(config);
+    if(defaults)onProgress?.('queued',{serviceDefault:defaults});
+    releaseSlot = await acquireLocalSlot(endpoint, { signal:controller.signal, task:probe?'probe':taskType, onProgress });
+    onProgress?.('requesting', {});
     response = await fetch(endpoint, {
       method: 'POST',
       headers: buildHeaders(config),
@@ -186,13 +264,20 @@ async function createCompletion(config, { messages, temperature = 0.2, maxTokens
         messages,
         temperature,
         max_tokens: maxTokens,
-        stream: false,
+        stream: measureStream,
+        ...(measureStream ? { stream_options: { include_usage: true } } : {}),
+        ...reasoningFields,
       }),
       signal: controller.signal,
     });
 
+    const headersMs = Math.round(performance.now() - started);
+    onProgress?.('waiting_output', { headersMs });
     // 必须在响应正文完整读取后再撤掉计时器和外部取消监听。
     // 部分服务会先返回响应头、再长时间等待模型生成正文。
+    if (response.ok && measureStream && response.headers.get('content-type')?.includes('text/event-stream')) {
+      return await readCompletionStream(response, endpoint, started, headersMs, onProgress);
+    }
     const bodyText = await response.text();
     if (!response.ok) throw errorFromResponse(response, bodyText, config);
     let data;
@@ -213,9 +298,11 @@ async function createCompletion(config, { messages, temperature = 0.2, maxTokens
     }
     return {
       text: content,
+      finishReason: data?.choices?.[0]?.finish_reason ?? null,
       raw: data,
       endpoint,
       usage: data.usage ?? null,
+      timing: { headersMs, totalMs: Math.round(performance.now() - started) },
     };
   } catch (error) {
     if (error instanceof ModelError) throw error;
@@ -231,6 +318,7 @@ async function createCompletion(config, { messages, temperature = 0.2, maxTokens
     }
     throw networkError(error, config);
   } finally {
+    releaseSlot();
     clearTimeout(timer);
     if (signal) signal.removeEventListener('abort', onAbort);
   }
@@ -246,17 +334,29 @@ async function testConnection(config, { signal } = {}) {
         { role: 'user', content: '只回复 OK。' },
       ],
       temperature: 0,
-      maxTokens: 8,
+      maxTokens: 128,
       signal,
+      probe: true,
     });
+    const reasoning = result.raw?.choices?.[0]?.message?.reasoning_content;
+    const reasoningTokens = result.usage?.completion_tokens_details?.reasoning_tokens;
+    const reasoningOnly = !result.text.trim() && result.finishReason === 'length'
+      && ((typeof reasoning === 'string' && reasoning.trim().length > 0) || reasoningTokens > 0);
+    if (!result.text.trim() && !reasoningOnly) {
+      const message = result.finishReason === 'length'
+        ? '模型输出达到上限，连接测试没有收到正文。'
+        : '模型接口已响应，但没有返回正文。';
+      throw new ModelError('invalid_response', message, { stage: 'response' });
+    }
     return {
       ok: true,
       durationMs: Date.now() - started,
       endpoint: result.endpoint,
+      ...(reasoningOnly ? { warning: '接口与模型已响应。128 tokens 测试预算在思考阶段用尽，尚未生成最终正文。' } : {}),
       checks: [
         { name: '配置', ok: true, detail: '字段格式正确。' },
         { name: '地址', ok: true, detail: '已收到模型 HTTP 响应。' },
-        { name: '认证与模型', ok: true, detail: '模型已返回内容。' },
+        { name: '认证与模型', ok: true, detail: reasoningOnly ? '已收到模型推理输出，最终正文未完成。' : '模型已返回内容。' },
       ],
     };
   } catch (error) {

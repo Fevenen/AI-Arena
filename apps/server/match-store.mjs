@@ -29,6 +29,7 @@ function summarize(match) {
     seatOrder: Array.isArray(match.seatOrder) ? match.seatOrder : Object.keys(match.seats ?? {}),
     moveCount: Array.isArray(match.actions) ? match.actions.length : 0,
     modeLabel: match.modeLabel,
+    aiPace: match.aiPace ?? 'quality',
     dafeiyuEnabled: Boolean(match.dafeiyu?.enabled),
     dafeiyuName: match.dafeiyu?.personaName ?? '大肥鱼',
   };

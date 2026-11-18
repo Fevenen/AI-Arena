@@ -161,7 +161,7 @@ function applyAction(state, seat, action) {
   };
 }
 
-function describeForModel({ state, seatId, recentActions = [] }) {
+function describeForModel({ state, seatId, recentActions = [], allowSpeech = false }) {
   const view = seatView(state, seatId);
   return {
     gameName: '三席测试局',
@@ -176,7 +176,7 @@ function describeForModel({ state, seatId, recentActions = [] }) {
     privateContext: { target: view.target, note: view.secretNote },
     lastMove: state.lastMove,
     recentActions,
-    responseFormat: '{"cell":5,"say":"可选的一句公开想法"}',
+    responseFormat: allowSpeech ? '{"cell":5,"say":"可选的一句公开想法"}' : '{"cell":5}',
   };
 }
 

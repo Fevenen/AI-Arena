@@ -1,6 +1,6 @@
 # 添加桌游
 
-AI Arena 的平台层负责游戏库、座位、回合、AI 调度、模型提示、记录、可见性和回放。正式游戏仍然只有自由五子棋；`tests/fixtures/three-seat-game.mjs` 是一个**只用于开发/测试**的三座位插件，用来证明新增游戏不需要改大厅、对局调度、模型客户端或大肥鱼桥。
+AI Arena 的平台层负责游戏库、座位、回合、AI 调度、模型提示、记录、可见性和回放。正式游戏注册在 `packages/games/index.mjs`（当前为自由五子棋、角斗士棋：双人对决和璀璨宝石）；`tests/fixtures/three-seat-game.mjs` 是一个**只用于开发/测试**的三座位插件，用来证明新增游戏不需要改大厅、对局调度、模型客户端或大肥鱼桥。
 
 ## 1. 插件放在哪里
 
@@ -10,12 +10,18 @@ packages/games/
   gomoku/
     index.mjs
     rules.mjs
+  blokus-duo/
+    index.mjs   Blokus Duo 插件入口
+    rules.mjs   规则、合法动作、跳过、计分
+    pieces.mjs  21 块棋子和去重朝向
   <your-game>/
     index.mjs
     rules.mjs
 tests/fixtures/
   three-seat-game.mjs   三座位测试插件（带私有目标）
 ```
+
+角斗士棋规则依据 Mattel 官方 Blokus Duo 说明（14×14、E5/J10 起点、未放格 -1、全放 +15、单格收尾 +5）：<https://mattel.co.jp/wp-content/uploads/2022/07/blokus_duo.pdf>。
 
 正式注册：
 
@@ -86,7 +92,13 @@ export default defineGamePlugin({
       mustBlocks: [],
       doubleThreatMoves: [],
       notes: [],
+      // 可选：服务端把该对象原样交给规则辅助模型，适合记录候选总数/展示数/筛选方式。
+      candidateInfo: { total: 0, shown: 0, filter: 'none' },
     };
+  },
+  getAutomaticAction({ state, seatId }) {
+    /* 可选：没有合法动作时返回 {type:'pass',...}，服务端会记录“系统跳过”。 */
+    return null;
   },
   chooseBotAction({ state, seat, seed }) { /* 内置机器人 */ },
   autoCommentCandidates({ previous, state, action, chat }) {
@@ -104,6 +116,7 @@ export default defineGamePlugin({
 - `getCurrentActor(state)` 决定调度；没有它时才回退到 `state.turn`。
 - 平台目前最多支持一位真人、一个大肥鱼棋手，其余座位可混合模型和内置机器人。
 - `validateAction` 必须自己检查回合、动作格式、空位/可用资源与终局，不能信任模型或网页。
+- 无合法动作的游戏可以实现可选 `getAutomaticAction({state, seatId})`。服务端在轮到该座位时自动执行并记录 `source: "system"` 的 `pass` 动作，再继续其他仍有合法动作的座位；不会调用模型。
 
 ### 公开视图与私有视图
 
@@ -118,6 +131,7 @@ export default defineGamePlugin({
 - `responseFormat` 是给模型的必填格式说明。
 - **纯模型**只拿到规则、公开局面/座位可见信息和格式；平台不注入合法候选或战术提示。
 - **规则辅助**额外把 `legalActions` 和 `getTacticalHints` 的结果交给模型；插件应尽量提供可验证的立即胜负点/必堵点。
+- 候选 ID 必须在当前局面内可重复生成；如果只展示部分合法动作，应把 `candidateInfo` 的 `total`、`shown` 和 `filter` 一并交给模型，并在复盘中保存相同说明。
 - 大肥鱼棋手沿用同一套 snapshot；桥不写死黑色/白色。
 
 ### 终局与 UI
@@ -173,7 +187,7 @@ const match = await harness.service.createMatch({
 - 规则版本变化后旧局仍用快照回放；
 - 私有目标结算。
 
-正式发布默认只注册五子棋；不要把测试插件加进 `GAME_PLUGINS`。
+正式发布默认注册正式游戏，包含支持 2–4 席的璀璨宝石；不要把测试插件加进 `GAME_PLUGINS`。
 
 ## 5. 专属网页组件
 
@@ -182,6 +196,7 @@ const match = await harness.service.createMatch({
 ```js
 const GAME_SURFACES = {
   gomoku: (ctx) => boardCard(ctx),
+  'blokus-duo': (ctx) => renderBlokusDuoSurface(ctx, helpers),
   'your-game': ({ match, view, interactive, humanColor }) => yourSurface({
     match, view, interactive, humanColor,
   }),

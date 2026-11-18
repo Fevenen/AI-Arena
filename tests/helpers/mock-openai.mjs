@@ -72,7 +72,7 @@ export async function createMockOpenAI(options = {}) {
       res.end(JSON.stringify(forced.body ?? { error: { message: 'forced failure' } }));
       return;
     }
-    let content = 'OK';
+    let answer = { content: 'OK', finishReason: 'stop' };
     if (state.responder) {
       const result = await state.responder(record, state);
       if (result && typeof result === 'object' && result.httpStatus) {
@@ -80,13 +80,18 @@ export async function createMockOpenAI(options = {}) {
         res.end(JSON.stringify(result.body));
         return;
       }
-      if (typeof result === 'string') content = result;
+      if (typeof result === 'string') answer.content = result;
+      else if (result && typeof result === 'object') answer = { ...answer, ...result };
     }
     const payload = JSON.stringify({
       id: `chatcmpl-${state.requests.length}`,
       object: 'chat.completion',
       model,
-      choices: [{ index: 0, message: { role: 'assistant', content }, finish_reason: 'stop' }],
+      choices: [{
+        index: 0,
+        message: { role: 'assistant', content: answer.content },
+        finish_reason: answer.finishReason,
+      }],
       usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
     });
     if (state.bodyDelayMs > 0) {

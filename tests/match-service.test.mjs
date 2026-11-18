@@ -10,7 +10,7 @@ import { MatchStore } from '../apps/server/match-store.mjs';
 import { EventHub } from '../apps/server/event-hub.mjs';
 import { MatchService } from '../apps/server/match-service.mjs';
 
-function modelInput(name, mock, { apiKey = '', retries = 0 } = {}) {
+function modelInput(name, mock, { apiKey = '', retries = 0, maxOutputTokens = 4800, reasoningEffort = 'default' } = {}) {
   return {
     name,
     provider: 'openai-compatible',
@@ -19,6 +19,8 @@ function modelInput(name, mock, { apiKey = '', retries = 0 } = {}) {
     apiKey,
     timeoutMs: 5000,
     maxRetries: retries,
+    maxOutputTokens,
+    reasoningEffort,
   };
 }
 
@@ -55,9 +57,14 @@ test('真人对模型：点击落子后模型经统一校验落子，座位和�
     assert.equal(match.actions[0].source, 'human');
     assert.equal(match.actions[1].source, 'model');
     assert.equal(match.actions[1].action.move, 'A1');
+    assert.equal(match.actions[1].modelMeta.reasoningEffort, 'default');
+    assert.equal(match.actions[1].modelMeta.maxTokens, 4800);
+    assert.equal(match.actions[1].modelMeta.tokenUsage.completionTokens, 5);
+    assert.equal(match.actions[1].modelMeta.tokenUsage.totalTokens, 15);
     assert.equal(match.state.board[7][7], 'black');
     assert.equal(match.state.board[14][0], 'white');
-    assert.equal(match.chat.some((chat) => chat.role === 'ai' && chat.kind === 'thought'), true);
+    assert.equal(match.chat.length, 0);
+    assert.doesNotMatch(JSON.stringify(mock.requests[0].body.messages), /公开想法|\bsay\b/);
     assert.equal(mock.requests.length, 1);
   } finally {
     await harness.cleanup();
@@ -132,7 +139,7 @@ test('两个独立模型配置互打，完整终局，模型 Key 只用于各自
       dafeiyu: { enabled: false },
     });
     await waitFor(() => harness.service.getMatch(match.id).status === 'finished', {
-      timeoutMs: 12000,
+      timeoutMs: 30000,
       message: '双模型对局未结束',
     });
     const finished = harness.service.getMatch(match.id);
@@ -185,7 +192,41 @@ test('模型非法落子有限重试后暂停，不再静默替换为机器人',
     assert.equal(paused.actionCount, 1);
     assert.equal(mock.requests.length, 2);
     assert.equal(paused.errors.length >= 1, true);
-    assert.equal(mock.requests.every((request) => request.body.max_tokens === 1200), true);
+    assert.equal(mock.requests.every((request) => request.body.max_tokens === 4800), true);
+  } finally {
+    await harness.cleanup();
+    await mock.close();
+  }
+});
+
+test('输出达到上限时增加落子预算，收到完整 JSON 后继续棋局', async () => {
+  const mock = await createMockOpenAI({
+    responder: (request) => request.body.max_tokens < 32768
+      ? { content: '', finishReason: 'length' }
+      : jsonMove('A1', '普通模型的发言应被忽略'),
+  });
+  const harness = await createServiceHarness({
+    models: [modelInput('思考模型', mock, { retries: 2, maxOutputTokens: 32768 })],
+  });
+  try {
+    const [model] = harness.configStore.listModels();
+    const { id } = await harness.service.createMatch({
+      gameId: 'gomoku',
+      seats: { black: { kind: 'human' }, white: { kind: 'model', modelId: model.id } },
+    });
+    await harness.service.submitHumanAction(id, {
+      seat: 'black',
+      action: { type: 'place', move: 'H8' },
+    });
+    const match = await waitFor(() => {
+      const snapshot = harness.service.getMatch(id);
+      return snapshot.actionCount === 2 ? snapshot : null;
+    });
+    assert.deepEqual(mock.requests.map(({ body }) => body.max_tokens), [16384, 32768]);
+    assert.equal(match.status, 'playing');
+    assert.equal(match.actions[1].action.move, 'A1');
+    assert.equal(match.actions[1].metrics.failures[0].code, 'model_output_truncated');
+    assert.equal(match.chat.length, 0);
   } finally {
     await harness.cleanup();
     await mock.close();
@@ -327,7 +368,7 @@ test('大肥鱼观战：手动提问、自动点评、语音开关、事件去�
       message: '大肥鱼没有连接',
     });
     await waitFor(() => harness.service.getMatch(match.id).status === 'finished', {
-      timeoutMs: 12000,
+      timeoutMs: 30000,
       message: '观战对局没有结束',
     });
     await waitFor(() => harness.service.getMatch(match.id).chat.some((chat) => chat.kind === 'comment'), {
@@ -456,7 +497,7 @@ test('没有观众时不再产生迟到自动点评；取消订阅会丢弃进�
     });
     harness.unsubscribe(match.id);
     await waitFor(() => harness.service.getMatch(match.id).status === 'finished', {
-      timeoutMs: 12000,
+      timeoutMs: 30000,
       message: '对局没有结束',
     });
     await new Promise((resolve) => setTimeout(resolve, 800));

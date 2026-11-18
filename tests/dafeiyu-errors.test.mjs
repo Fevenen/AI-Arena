@@ -108,7 +108,7 @@ test('后台自动点评失败不会把棋手判成掉线，也不会暂停棋�
       message: '大肥鱼没有连接',
     });
     await waitFor(() => mock.requestsFor('comment').length >= 1, {
-      timeoutMs: 6000,
+      timeoutMs: 15000,
       message: '没有尝试自动点评',
     });
     await new Promise((resolve) => setTimeout(resolve, 200));

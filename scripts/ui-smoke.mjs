@@ -19,6 +19,8 @@ import { PROJECT_ROOT } from '../apps/server/config-store.mjs';
 import { createMockOpenAI } from '../tests/helpers/mock-openai.mjs';
 import { createMockDafeiyu } from '../tests/helpers/mock-dafeiyu.mjs';
 import { gomokuGame } from '../packages/games/gomoku/index.mjs';
+import splendorGame from '../packages/games/splendor/index.mjs';
+import { blokusDuoGame } from '../packages/games/blokus-duo/index.mjs';
 import { threeSeatGame } from '../tests/fixtures/three-seat-game.mjs';
 
 const SHOT_DIR = path.join(PROJECT_ROOT, 'data', 'ui-check');
@@ -365,7 +367,7 @@ async function main() {
     app = await createArenaApp({
       configPath,
       logger: { info() {}, warn() {}, error() {} },
-      gamePlugins: [gomokuGame, threeSeatGame],
+      gamePlugins: [gomokuGame, threeSeatGame, blokusDuoGame, splendorGame],
     });
     await app.start({ port: 0, host: '127.0.0.1' });
     browser = await launchBrowser(edgePath, `${app.publicUrl}/#/lobby`);
@@ -417,10 +419,12 @@ async function main() {
     // ---- 开桌、落子、暂停、继续、结束 ----
     await click('a[href="#/lobby"]');
     await waitPage("document.querySelector('[data-action=quick-demo]') !== null", 10000, '返回开桌失败');
+    await setSelect('select[data-change="ai-pace"]', 'fast');
     await click('[data-action="quick-demo"]');
     await waitPage("location.hash.startsWith('#/match/') && document.querySelector('.board-grid') !== null", 12000, '对局页未打开');
     const firstMatchId = await evaluate("location.hash.split('/').at(-1)");
     matchIds.push(firstMatchId);
+    assert.equal(await evaluate("document.querySelector('#match-title-chips [data-pace=fast]').textContent"), '限时模式 · 每手 25 秒');
     await waitFor(async () => (await getMatch(firstMatchId)).controls.isHumanTurn, {
       timeoutMs: 10000,
       message: '首局没有进入真人回合',
@@ -447,13 +451,20 @@ async function main() {
     await click('a[href="#/history"]');
     await waitPage("document.querySelector('.history-row') !== null", 10000, '历史记录未显示');
     await waitPage(`document.querySelector('[data-action="open-replay"][data-id="${firstMatchId}"]') !== null`, 8000, '历史中没有该局回放入口');
+    assert.equal(await evaluate("[...document.querySelectorAll('.history-row')].find(row=>row.querySelector('[data-id=\"" + firstMatchId + "\"]'))?.querySelector('[data-pace=fast]')?.textContent"), '限时模式 · 每手 25 秒');
     await screenshot('06-history.png');
     await click(`[data-action="open-replay"][data-id="${firstMatchId}"]`);
     await waitPage("document.querySelector('.replay-page') !== null && document.querySelectorAll('.board-grid .cell').length === 225", 10000, '回放页未打开');
+    assert.equal(await evaluate("document.querySelector('.replay-page [data-pace=fast]').textContent"), '限时模式 · 每手 25 秒');
     await screenshot('07-replay.png');
     const beforeStep = await evaluate("document.querySelector('.replay-progress .mono').innerText");
+    await evaluate("document.querySelector('[data-action=replay-prev]').focus(); true");
     await click('[data-action="replay-prev"]');
     await waitPage(`document.querySelector('.replay-progress .mono').innerText !== ${JSON.stringify(beforeStep)}`, 5000, '回放上一手无效');
+    assert.equal(await evaluate("document.activeElement.dataset.action === 'replay-prev' || document.activeElement.dataset.change === 'replay-range'"), true);
+    await setViewport(480);
+    assert.equal(await evaluate('document.documentElement.scrollWidth <= window.innerWidth + 2'), true);
+    await setViewport(1440);
     await click('[data-action="replay-next"]');
     await waitPage(`document.querySelector('.replay-progress .mono').innerText === ${JSON.stringify(beforeStep)}`, 5000, '回放下一手无效');
 
@@ -478,6 +489,20 @@ async function main() {
     await evaluate("document.querySelector('form[data-form=chat]').requestSubmit(); true");
     await waitFor(() => petMock.requestsFor('speak').length > 0, { timeoutMs: 12000, message: '语音开启后没有调用桌宠播报' });
     await waitPage("[...document.querySelectorAll('.voice-note')].some(el => el.innerText.includes('语音已排队'))", 8000, '语音状态未显示');
+    const desktopHeaders = { 'X-Arena-Desktop': '1' };
+    const desktopState = () => api('/api/desktop-companion', { headers: desktopHeaders }).then(response => response.state);
+    assert.equal((await desktopState()).matchId, watcherMatchId);
+    assert.equal((await desktopState()).role, 'observer');
+    assert.equal((await desktopState()).voice, true);
+    await api('/api/desktop-companion', { method: 'POST', headers: desktopHeaders, body: {
+      type: 'voice', matchId: watcherMatchId, value: false,
+    } });
+    await waitPage("!document.querySelector('input[data-change=match-voice]').checked", 6000, '桌宠关闭语音后网页没有同步');
+    await api('/api/desktop-companion', { method: 'POST', headers: desktopHeaders, body: {
+      type: 'question', matchId: watcherMatchId, text: '这条问题来自桌宠。',
+    } });
+    await waitPage("document.querySelector('#chat-log').innerText.includes('这条问题来自桌宠。')", 6000, '桌宠问答没有同步到网页');
+
     await api(`/api/matches/${encodeURIComponent(watcherMatchId)}/dafeiyu/disconnect`, { method: 'POST' });
     await waitMatch(watcherMatchId, (match) => match.dafeiyu?.status === 'disconnected', 8000, '手动断开未生效');
     await waitPage("document.querySelector('.dafeiyu-side [data-action=reconnect-dafeiyu]') !== null", 8000, '断开后没有重连按钮');
@@ -597,6 +622,126 @@ async function main() {
     await screenshot('13-three-replay.png');
     await click('a[href="#/lobby"]');
     await waitPage("document.querySelector('.library-page') !== null", 10000, '三席回放返回桌游库失败');
+
+    // ---- 角斗士棋：大厅、选棋/旋转/预览、真人落子、AI 完整局、回放 ----
+    await click('[data-action="select-game"][data-game="blokus-duo"]');
+    await waitPage("document.querySelector('[data-seat=gold]') !== null && document.querySelectorAll('.seat-setup').length === 2", 8000, '角斗士棋座位配置未出现');
+    await click('[data-action="start-match"]');
+    await waitPage("location.hash.startsWith('#/match/') && document.querySelector('.blokus-board') !== null", 12000, '角斗士棋对局未打开');
+    const blokusId = await evaluate("location.hash.split('/').at(-1)");
+    matchIds.push(blokusId);
+    assert.equal(await evaluate("document.querySelectorAll('.blokus-cell').length"), 196);
+    assert.equal(await evaluate("document.querySelectorAll('.blokus-piece').length"), 21);
+    assert.equal(await evaluate("document.querySelectorAll('.blokus-cell.start-point').length"), 2);
+
+    await evaluate("document.querySelector('.match-page .back-link').focus()");
+    await click('[data-action="blokus-piece"][data-piece="P3-02"]');
+    assert.equal(await evaluate("document.activeElement.matches('.match-page .back-link')"), true, '角斗士棋刷新不应把焦点抢到棋盘');
+    const selectedShape = () => evaluate("Array.from(document.querySelectorAll('.blokus-selected .blokus-mini i'), cell => [cell.style.gridRow, cell.style.gridColumn]).sort()");
+    assert.deepEqual(await selectedShape(), [['1', '1'], ['1', '2'], ['2', '1']]);
+    await click('[data-action="blokus-flip"]');
+    assert.deepEqual(await selectedShape(), [['1', '1'], ['1', '2'], ['2', '2']], 'L 形棋子翻面后的缩略图必须真实镜像');
+    await click('[data-action="blokus-flip"]');
+    assert.deepEqual(await selectedShape(), [['1', '1'], ['1', '2'], ['2', '1']]);
+    await click('[data-action="blokus-cancel"]');
+
+    await evaluate(`(() => {
+      const style = document.createElement('style');
+      style.id = 'test-short-tray';
+      style.textContent = '.blokus-tray { max-height: 47px !important }';
+      document.head.append(style);
+      document.querySelector('.blokus-tray').scrollTop = 50;
+    })()`);
+    const trayScroll = await evaluate("document.querySelector('.blokus-tray').scrollTop");
+    assert.ok(trayScroll > 0);
+    await click('[data-action="blokus-piece"][data-piece="P5-09"]');
+    assert.equal(await evaluate("document.querySelector('.blokus-tray').scrollTop"), trayScroll);
+    await evaluate("document.getElementById('test-short-tray').remove()");
+    const firstOrientation = await evaluate("document.querySelector('.blokus-selected small')?.innerText ?? ''");
+    await click('[data-action="blokus-rotate"]');
+    const rotated = await evaluate("document.querySelector('.blokus-selected small')?.innerText ?? ''");
+    assert.notEqual(rotated, firstOrientation);
+    await click('[data-action="blokus-flip"]');
+    const flipped = await evaluate("document.querySelector('.blokus-selected small')?.innerText ?? ''");
+    assert.notEqual(flipped, rotated);
+    await click('[data-action="blokus-cancel"]');
+
+    await click('[data-action="blokus-piece"][data-piece="P2-01"]');
+    await click('.blokus-cell[data-coord="E6"]');
+    assert.ok(await evaluate("document.querySelectorAll('.blokus-cell.preview-invalid').length > 0"));
+    assert.match(await evaluate("document.querySelector('.blokus-preview')?.innerText ?? ''"), /起始点|己方棋边/);
+    assert.equal((await getMatch(blokusId)).actionCount, 0);
+    await screenshot('16-blokus-invalid-preview.png');
+
+    await click('[data-action="blokus-cancel"]');
+    await click('[data-action="blokus-piece"][data-piece="P1-01"]');
+    await click('.blokus-cell[data-coord="E5"]');
+    assert.ok(await evaluate("document.querySelectorAll('.blokus-cell.preview-valid').length === 1"));
+    await screenshot('16-blokus-preview.png');
+    await click('[data-action="pause-match"]');
+    await waitPage("document.querySelectorAll('.blokus-tray .blokus-piece:disabled').length === 21", 8000, '暂停时仍应显示真人自己的棋子托盘');
+    await click('[data-action="resume-match"]');
+    await waitPage("document.querySelector('[data-action=blokus-confirm]:enabled') !== null", 8000, '恢复后应保留尚未提交的落子预览');
+    await click('[data-action="blokus-confirm"]');
+    await waitMatch(blokusId, (match) => match.actionCount >= 2 && !match.pending, 15000, '角斗士棋真人/机器人没有完成一手');
+    assert.equal((await getMatch(blokusId)).actions[0].seat, 'gold');
+    await screenshot('17-blokus-match.png');
+    await setViewport(900);
+    await screenshot('19-blokus-900.png');
+    assert.equal(await evaluate('document.documentElement.scrollWidth <= window.innerWidth + 2'), true);
+    await setViewport(480);
+    await screenshot('20-blokus-480.png');
+    assert.equal(await evaluate('document.documentElement.scrollWidth <= window.innerWidth + 2'), true);
+    assert.ok(await evaluate("document.querySelectorAll('.blokus-cell').length === 196"));
+    await setViewport(1440);
+    await endMatchIfActive(blokusId);
+
+    const aiBlokus = await api('/api/matches', {
+      method: 'POST',
+      body: {
+        gameId: 'blokus-duo',
+        seats: { gold: { kind: 'bot' }, blue: { kind: 'bot' } },
+        dafeiyu: { enabled: false },
+      },
+    });
+    const aiBlokusId = aiBlokus.match.id;
+    matchIds.push(aiBlokusId);
+    const finishedAi = await waitMatch(
+      aiBlokusId,
+      (match) => match.status === 'finished' ? match : null,
+      20000,
+      '角斗士棋双机器人对局没有结束',
+    );
+    assert.ok(finishedAi.outcome?.scores?.gold);
+    await evaluate(`location.hash = '#/replay/${encodeURIComponent(aiBlokusId)}'`);
+    await waitPage("document.querySelector('.blokus-board') !== null && document.querySelector('.blokus-final-summary') !== null", 12000, '角斗士棋回放未打开');
+    assert.equal(await evaluate("document.querySelectorAll('.blokus-cell').length"), 196);
+    assert.match(await evaluate("document.querySelector('.blokus-final-summary').innerText"), /分/);
+    await screenshot('18-blokus-replay.png');
+    await click('a[href="#/lobby"]');
+    await waitPage("document.querySelector('.library-page') !== null", 10000, '角斗士棋回放返回桌游库失败');
+
+    // ---- 璀璨宝石多人牌桌与私有视图 ----
+    await click('[data-action="select-game"][data-game="splendor"]');
+    await setSelect('select[data-change="player-count"]', '4');
+    assert.equal(await evaluate("document.querySelectorAll('.seat-setup').length"), 4);
+    await click('[data-action="start-match"]');
+    await waitPage("document.querySelector('.splendor-surface') && document.querySelector('[data-move=\"reserve:deck1\"]')", 12000, '璀璨宝石牌桌未打开');
+    const splendorId = await evaluate("location.hash.split('/').at(-1)");
+    matchIds.push(splendorId);
+    await click('[data-move="reserve:deck1"]');
+    await waitPage("document.querySelector('.spl-reserved .spl-card') !== null", 12000, '真人席没有看到自己的预留暗牌');
+    const splendorReplay = await api('/api/matches/' + splendorId + '/replay');
+    assert.equal(splendorReplay.seed, null);
+    assert.ok(splendorReplay.steps.every(step => step.view.players.east.reserved === undefined));
+    await screenshot('22-splendor-table.png');
+    await setViewport(480);
+    assert.equal(await evaluate('document.documentElement.scrollWidth <= window.innerWidth + 2'), true);
+    await screenshot('23-splendor-480.png');
+    await setViewport(1440);
+    await endMatchIfActive(splendorId);
+    await click('a[href="#/lobby"]');
+    await waitPage("document.querySelector('.library-page') !== null", 10000, '璀璨宝石已结束但未回到桌游库');
 
     // ---- 常见 Windows 宽度与窄窗口 ----
     await setViewport(900);

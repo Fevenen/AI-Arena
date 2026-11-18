@@ -1,9 +1,16 @@
+import { publicReservations } from './games/splendor/reservations.js';
+import { renderInlineMatchTiming } from './monitor-match.js';
+import { mountMonitor } from './monitor.js';
+import { renderSplendor } from './games/splendor/surface.js';
+import { handleBlokusDuoAction, renderBlokusDuoSurface } from './games/blokus-duo/surface.js';
+
 const appRoot = document.querySelector('#app');
 const modalRoot = document.querySelector('#modal-root');
 const toastRoot = document.querySelector('#toast-root');
 
 const state = {
   boot: null,
+  monitorStop: null,
   route: null,
   models: [],
   dafeiyu: null,
@@ -12,10 +19,12 @@ const state = {
   healthCheckedAt: 0,
   match: null,
   eventSource: null,
+  streamMatchId: null,
   sseState: null,
   actionBusy: false,
   askBusy: false,
   chatDraft: '',
+  deepAnalysis: false,
   chatComposing: false,
   pendingMatchUpdate: false,
   matchShellId: null,
@@ -262,6 +271,7 @@ function parseRoute() {
   if (!parts.length) return { name: 'lobby' };
   if (parts[0] === 'lobby') return { name: 'lobby' };
   if (parts[0] === 'models') return { name: 'models' };
+  if (parts[0] === 'monitor') return { name: 'monitor' };
   if (parts[0] === 'history') return { name: 'history' };
   if (parts[0] === 'match' && parts[1]) return { name: 'match', id: decodeURIComponent(parts[1]) };
   if (parts[0] === 'replay' && parts[1]) return { name: 'replay', id: decodeURIComponent(parts[1]) };
@@ -270,12 +280,12 @@ function parseRoute() {
 
 function activeNavFor(route) {
   if (route.name === 'models') return 'models';
+  if (route.name === 'monitor') return 'monitor';
   if (route.name === 'history' || route.name === 'replay') return 'history';
   return 'lobby';
 }
 
 function renderShell(content, active = 'lobby') {
-  const modelsCount = state.models.length;
   appRoot.className = '';
   appRoot.innerHTML = `
     <div class="app-shell">
@@ -284,33 +294,23 @@ function renderShell(content, active = 'lobby') {
           <span class="brand-mark" aria-hidden="true"></span>
           <span class="brand-copy">
             <span class="brand-name">AI Arena</span>
-            <span class="brand-sub">LOCAL BOARD GAME ARENA</span>
           </span>
         </a>
         <nav class="nav" aria-label="主导航">
-          <div class="nav-section-label">本机竞技场</div>
-          <a class="nav-link ${active === 'lobby' ? 'active' : ''}" href="#/lobby">
-            ${icon('board')}<span>桌游库</span><span class="nav-badge">${(state.boot?.games ?? []).length}</span>
+          <a class="nav-link ${active === 'lobby' ? 'active' : ''}" href="#/lobby" ${active === 'lobby' ? 'aria-current="page"' : ''}>
+            ${icon('board')}<span>桌游库</span>
           </a>
-          <a class="nav-link ${active === 'history' ? 'active' : ''}" href="#/history">
+          <a class="nav-link ${active === 'history' ? 'active' : ''}" href="#/history" ${active === 'history' ? 'aria-current="page"' : ''}>
             ${icon('history')}<span>对局记录</span>
           </a>
-          <a class="nav-link ${active === 'models' ? 'active' : ''}" href="#/models">
-            ${icon('cpu')}<span>模型管理</span><span class="nav-badge">${modelsCount}</span>
+          <a class="nav-link ${active === 'models' ? 'active' : ''}" href="#/models" ${active === 'models' ? 'aria-current="page"' : ''}>
+            ${icon('cpu')}<span>模型管理</span>
           </a>
+          <a class="nav-link ${active === 'monitor' ? 'active' : ''}" href="#/monitor"  ${active === 'monitor' ? 'aria-current="page"' : ''}>${icon('clock')}<span>模型监控</span></a>
         </nav>
         <div class="sidebar-footer">
-          <div class="local-status">
-            <div class="local-status-row">
-              <span class="local-status-strong">本机竞技场</span>
-              <span class="chip chip-accent">LOCAL</span>
-            </div>
-            <div class="local-status-meta">
-              ${escapeHtml(state.boot?.app?.url ?? '127.0.0.1')}<br />
-              v${escapeHtml(state.boot?.app?.version ?? '0.1.0')} · 单机运行
-            </div>
-          </div>
-          <p class="sidebar-note">选桌游、排座位、开始对局。<br />模型 Key 由后端保管，不进入棋盘。</p>
+          <span class="local-indicator"><span class="dot dot-live"></span> 本机运行</span>
+          <span class="local-version">v${escapeHtml(state.boot?.app?.version ?? '0.1.0')}</span>
         </div>
       </aside>
       <div class="main-column">
@@ -319,11 +319,10 @@ function renderShell(content, active = 'lobby') {
     </div>`;
 }
 
-function renderPageHead({ eyebrow, title, subtitle = '', actions = '' }) {
+function renderPageHead({ title, subtitle = '', actions = '' }) {
   return `
     <header class="page-head">
       <div>
-        <p class="eyebrow">${escapeHtml(eyebrow)}</p>
         <h1 class="page-title">${title}</h1>
         ${subtitle ? `<p class="page-subtitle">${subtitle}</p>` : ''}
       </div>
@@ -374,7 +373,8 @@ function gameDef(id = state.lobby.gameId) {
 }
 
 function orderedSeatDefs(game) {
-  return [...(game?.seats ?? [])].sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
+  const ordered = [...(game?.seats ?? [])].sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
+  return game?.variableSeats ? ordered.slice(0, state.lobby.playerCounts?.[game.id] ?? game.minPlayers) : ordered;
 }
 
 function defaultLobbySeats(game, { quick = false } = {}) {
@@ -409,11 +409,11 @@ function ensureLobbyGame(gameId = state.lobby.gameId, { quick = false, reset = f
   }
   if (quick) state.lobby.setups[game.id] = defaultLobbySeats(game, { quick: true });
   // 清理不属于当前游戏的旧座位，避免切换后把错误座位发给后端。
-  const valid = new Set(game.seats.map((seat) => seat.id));
+  const valid = new Set(orderedSeatDefs(game).map((seat) => seat.id));
   for (const id of Object.keys(state.lobby.setups[game.id])) {
     if (!valid.has(id)) delete state.lobby.setups[game.id][id];
   }
-  for (const def of game.seats) {
+  for (const def of orderedSeatDefs(game)) {
     if (!state.lobby.setups[game.id][def.id]) {
       state.lobby.setups[game.id][def.id] = { kind: 'bot', modelId: '', moveMode: 'assisted' };
     }
@@ -429,9 +429,23 @@ function lobbySeats() {
 }
 
 function seatDefFor(match, seatId) {
-  return match?.game?.seats?.find((seat) => seat.id === seatId)
+  const found = match?.game?.seats?.find((seat) => seat.id === seatId)
     ?? orderedSeatDefs(gameDef(match?.gameId)).find((seat) => seat.id === seatId)
     ?? { id: seatId, name: match?.seats?.[seatId]?.colorName ?? seatId, color: null, order: 0 };
+  // Blokus used to call its first seat "gold". Keep the internal id and old
+  // snapshots readable, but render that side as red everywhere.
+  if (match?.gameId === 'blokus-duo' && found.id === 'gold') {
+    return { ...found, name: '红方', shortName: '红', color: 'red' };
+  }
+  return found;
+}
+
+function seatDisplayName(match, seatId) {
+  return seatDefFor(match, seatId)?.name ?? match?.seats?.[seatId]?.name ?? seatId;
+}
+
+function displayResultLabel(value) {
+  return String(value ?? '').replaceAll('金方', '红方');
 }
 
 function modelNameFor(seat) {
@@ -540,7 +554,10 @@ function seatColor(def) {
   const colors = {
     black: '#1c252b',
     white: '#e9e1cf',
-    gold: '#d6a84b',
+    // "gold" is the legacy internal color of the Blokus first seat.
+    // New games use red, and old snapshots are rendered red too.
+    gold: '#d95b5b',
+    red: '#d95b5b',
     blue: '#759bc7',
     violet: '#a88bd8',
   };
@@ -549,7 +566,32 @@ function seatColor(def) {
 
 function seatToken(def) {
   const ink = ['white', 'gold'].includes(def?.color) ? '#102018' : '#f4fbf7';
-  return `<span class="seat-token" style="--seat-color:${escapeAttr(seatColor(def))};--seat-ink:${ink}" aria-hidden="true">${escapeHtml(def.shortName ?? def.name.slice(0, 1))}</span>`;
+  return `<span class="seat-token" style="--seat-color:${escapeAttr(seatColor(def))};--seat-ink:${ink}" aria-hidden="true">${escapeHtml(/^[0-9]+/.exec(def.name)?.[0] ?? def.shortName ?? def.name.slice(0, 1))}</span>`;
+}
+
+function gamePreview(gameId) {
+  if (gameId === 'gomoku') {
+    const stones = [[2, 4, 'dark'], [3, 3, 'light'], [3, 4, 'dark'], [3, 5, 'light'],
+      [4, 3, 'dark'], [4, 4, 'light'], [5, 3, 'light'], [5, 2, 'dark'], [6, 3, 'dark']];
+    return `<div class="preview-board">${stones.map(([x, y, tone]) =>
+      `<i class="preview-stone ${tone}" style="--x:${x};--y:${y}"></i>`).join('')}</div>`;
+  }
+  if (gameId === 'blokus-duo') {
+    const pieces = [
+      ['violet', [[1, 1], [2, 1], [2, 2], [2, 3], [3, 3], [4, 4], [4, 5], [5, 5], [5, 6]]],
+      ['coral', [[5, 2], [6, 2], [7, 2], [6, 3], [7, 4], [7, 5], [7, 6], [8, 5], [9, 5]]],
+      ['blue', [[1, 5], [1, 6], [2, 6], [3, 6], [1, 7]]],
+    ];
+    return `<div class="preview-mosaic">${pieces.map(([tone, squares]) => squares.map(([x, y]) =>
+      `<i class="preview-block ${tone}" style="--x:${x};--y:${y}"></i>`).join('')).join('')}</div>`;
+  }
+  if (gameId === 'splendor') {
+    return `<div class="preview-market">
+      <i class="preview-card ruby"></i><i class="preview-card emerald"></i><i class="preview-card sapphire"></i>
+      <i class="preview-gem amber"></i><i class="preview-gem violet"></i>
+    </div>`;
+  }
+  return `<span class="preview-placeholder">${icon('board')}</span>`;
 }
 
 function renderGameCard(game) {
@@ -559,18 +601,14 @@ function renderGameCard(game) {
     : `${game.minPlayers}–${game.maxPlayers} 人`;
   return `
     <button class="game-card ${selected ? 'selected' : ''}" type="button" data-action="select-game" data-game="${escapeAttr(game.id)}" aria-pressed="${selected}">
-      <div class="game-card-top">
-        <span class="game-card-icon">${icon(game.id === 'gomoku' ? 'board' : 'users')}</span>
-        <span class="game-card-count">${escapeHtml(players)}</span>
+      <div class="game-art" data-art="${escapeAttr(game.id)}" aria-hidden="true">${gamePreview(game.id)}</div>
+      <div class="game-card-body">
+        <div class="game-card-top"><span class="game-card-count">${escapeHtml(players)}</span>
+          ${selected ? '<span class="game-selected">' + icon('check', 'icon-sm') + ' 已选择</span>' : ''}
+        </div>
+        <h2>${escapeHtml(game.name)}</h2>
+        <p>${escapeHtml(game.description ?? '')}</p>
       </div>
-      <h3>${escapeHtml(game.name)}</h3>
-      <p>${escapeHtml(game.description ?? '')}</p>
-      <div class="game-card-foot">
-        <span>${game.seats.length} 席</span>
-        <span>真人 / 模型 / 内置机器人 / 大肥鱼</span>
-        <span>规则 v${escapeHtml(game.rulesVersion)}</span>
-      </div>
-      <span class="game-card-cta">${selected ? '当前选择' : '选择这个桌游'} ${selected ? icon('check', 'icon-sm') : icon('arrowRight', 'icon-sm')}</span>
     </button>`;
 }
 
@@ -584,7 +622,7 @@ function renderSeatSetup(game, def, seat, index) {
           ${seatToken(def)}
           <div>
             <div class="seat-side">${escapeHtml(def.name)}</div>
-            <div class="seat-turn-note">第 ${index + 1} 席 · ${index === 0 ? '先手' : `顺序 ${index + 1}`}</div>
+            <div class="seat-turn-note">${index === 0 ? '先手' : `第 ${index + 1} 顺位`}</div>
           </div>
         </div>
         <span class="chip ${seat.kind === 'human' ? 'chip-accent' : seat.kind === 'dafeiyu' ? 'chip-gold' : ''}">${escapeHtml(KIND_LABELS[seat.kind])}</span>
@@ -615,7 +653,7 @@ function renderSeatSetup(game, def, seat, index) {
               <option value="assisted" ${seat.moveMode !== 'pure' ? 'selected' : ''}>规则辅助 · 合法候选与战术提示</option>
               <option value="pure" ${seat.moveMode === 'pure' ? 'selected' : ''}>纯模型 · 只给规则和局面</option>
             </select>
-            <span class="field-hint">规则辅助会加入合法候选、立即成五点和必堵点；纯模型用于比较模型本身。</span>
+            <span class="field-hint">规则辅助提供这款桌游的合法候选和可用提示。</span>
           </label>
         ` : ''}
       </div>
@@ -639,7 +677,6 @@ function renderLobby() {
   const hasDafeiyuSeat = lobbyHasDafeiyuSeat();
   const dafeiyuConfig = state.dafeiyu ?? state.boot?.dafeiyu ?? {};
   const allAi = defs.every((def) => seats[def.id]?.kind !== 'human');
-  const firstSeat = defs[0];
   const validationNotice = errors.length
     ? `<div class="notice notice-warn mt-12">${icon('alert')}<span>${errors.map(escapeHtml).join('<br />')}</span></div>`
     : '';
@@ -654,25 +691,15 @@ function renderLobby() {
     <div class="page library-page">
       <header class="library-head">
         <div>
-          <p class="eyebrow">AI ARENA · LOCAL</p>
-          <h1 class="page-title">桌游库</h1>
-          <p class="page-subtitle">选一张桌子，安排座位，然后开始。模型、内置机器人和大肥鱼可以混坐。</p>
+          <h1 class="page-title" id="library-heading">桌游库</h1>
+          <p class="page-subtitle">选一款桌游，安排座位，和 AI 同桌。</p>
         </div>
         <div class="library-head-meta">
-          <span class="chip chip-accent">${state.boot?.games?.length ?? 0} 款可玩</span>
-          <span class="chip">${state.models.length} 个模型配置</span>
-          <span class="js-health">${healthBadge()}</span>
+          <button class="btn" type="button" data-action="quick-demo" title="真人对内置机器人">${icon('play', 'icon-sm')} 快速试玩</button>
         </div>
       </header>
 
       <section class="game-library" aria-labelledby="library-heading">
-        <div class="section-heading">
-          <div>
-            <p class="eyebrow">GAME LIBRARY</p>
-            <h2 id="library-heading">可以玩的游戏</h2>
-          </div>
-          <span class="section-note">第一款正式游戏：自由五子棋</span>
-        </div>
         <div class="game-grid">
           ${gameDefs().map(renderGameCard).join('')}
         </div>
@@ -682,36 +709,50 @@ function renderLobby() {
         <section class="card seat-setup-card">
           <div class="setup-title-row">
             <div>
-              <p class="eyebrow">TABLE SETUP · ${escapeHtml(game.id.toUpperCase())}</p>
-              <h2>${escapeHtml(game.name)}</h2>
-              <p>${escapeHtml(game.description ?? '')}</p>
+              <h2 id="table-setup-heading">配置对局</h2>
+              <p>${escapeHtml(game.name)}</p>
             </div>
             <div class="setup-chips">
-              <span class="chip chip-gold">${game.seats.length} 席</span>
+              <span class="chip chip-gold">${defs.length} 席</span>
               <span class="chip">规则 v${escapeHtml(game.rulesVersion)}</span>
             </div>
           </div>
-          <div class="game-facts">
-            <span>${defs.length === 2 ? '双人对局' : `${defs.length} 人同桌`}</span>
-            <span>${allAi ? '可全 AI 观战' : '支持真人 + AI'}</span>
-            <span>${game.supportsSpectator ? '大肥鱼可观战' : '仅对局'}</span>
-            <span>${game.minPlayers === game.maxPlayers ? `${game.minPlayers} 人` : `${game.minPlayers}–${game.maxPlayers} 人`}</span>
+          <div class="setup-options">
+          ${game.variableSeats ? `<label class="field"><span class="field-label">人数</span><select class="select" data-change="player-count" aria-label="人数">${Array.from({length: game.maxPlayers - game.minPlayers + 1}, (_, index) => {
+            const count = game.minPlayers + index;
+            return `<option value="${count}" ${count === defs.length ? 'selected' : ''}>${count} 人</option>`;
+          }).join('')}</select></label>` : ''}
+          <label class="field"><span class="field-label">对局模式</span><select class="select" data-change="ai-pace" aria-label="模型节奏">
+            <option value="quality" ${state.lobby.aiPace === 'fast' ? '' : 'selected'}>正常模式</option>
+            <option value="fast" ${state.lobby.aiPace === 'fast' ? 'selected' : ''}>限时模式 · 每手 25 秒</option>
+          </select></label>
           </div>
           <div class="seat-setup-grid" style="--seat-count:${defs.length}">
             ${defs.map((def, index) => renderSeatSetup(game, def, seats[def.id], index)).join('')}
           </div>
-          <div class="seat-rules-note">
-            ${icon('info')}
-            <span>所有动作由同一个后端校验：座位、回合、规则、可见范围与终局。模型或大肥鱼返回非法动作时会有限重试，失败即暂停。</span>
-          </div>
           ${validationNotice}
           <details class="rules-details game-rules">
             <summary>规则与座位说明</summary>
-            <pre>${escapeHtml((game.rulesText ?? '').trim())}\n\n座位顺序：${defs.map((def) => `${escapeHtml(def.name)}（${escapeHtml(def.id)}）`).join(' → ')}</pre>
+            <pre>${escapeHtml((game.rulesText ?? '').trim())}\n\n座位顺序：${defs.map((def) => escapeHtml(def.name)).join(' → ')}</pre>
           </details>
         </section>
 
         <aside class="lobby-side">
+          <section class="card start-panel">
+            <div class="start-panel-head">
+              <div>
+                <h3>开局名单</h3>
+              </div>
+            </div>
+            <div class="start-seat-list">${playerLine}</div>
+            <button class="btn btn-primary btn-lg btn-block" type="button" data-action="start-match" ${errors.length ? 'disabled' : ''}>
+              ${icon('play')} 开始对局
+            </button>
+            <div class="start-notes">
+              <div class="start-note"><span class="dot dot-live"></span><span>${allAi ? '全部座位由 AI 控制：开局后可观战、暂停和单步推进。' : '你在自己座位行动，AI 回合自动进行。'}</span></div>
+            </div>
+          </section>
+
           <section class="dafeiyu-invite">
             <div class="dafeiyu-head">
               <span class="whale-avatar" aria-hidden="true">鲸</span>
@@ -727,27 +768,27 @@ function renderLobby() {
                 <div class="switch-desc">${hasDafeiyuSeat ? '她已入座棋手席，桌宠连接随座位开启。' : '读取公开棋盘，从双方视角点评。'}</div>
               </div>
               <label class="switch">
-                <input type="checkbox" data-change="lobby-observer" ${activeDafeiyu ? 'checked' : ''} ${hasDafeiyuSeat ? 'disabled' : ''} />
+                <input type="checkbox" data-change="lobby-observer" aria-label="邀请大肥鱼观战" ${activeDafeiyu ? 'checked' : ''} ${hasDafeiyuSeat ? 'disabled' : ''} />
                 <span class="switch-track"></span>
               </label>
             </div>
             <div class="switch-row">
               <div class="switch-copy">
                 <div class="switch-title">${icon('spark', 'icon-sm')} 自动点评</div>
-                <div class="switch-desc">只挑成五威胁、胜负手和终局；落子优先，过时点评会丢弃。</div>
+                <div class="switch-desc">在关键回合和终局点评。</div>
               </div>
               <label class="switch">
-                <input type="checkbox" data-change="lobby-auto" ${state.lobby.autoComment ? 'checked' : ''} ${activeDafeiyu ? '' : 'disabled'} />
+                <input type="checkbox" data-change="lobby-auto" aria-label="自动点评" ${state.lobby.autoComment ? 'checked' : ''} ${activeDafeiyu ? '' : 'disabled'} />
                 <span class="switch-track"></span>
               </label>
             </div>
             <div class="switch-row">
               <div class="switch-copy">
                 <div class="switch-title">${icon(state.lobby.voice ? 'volume' : 'volumeOff', 'icon-sm')} 语音播报</div>
-                <div class="switch-desc">复用桌宠现有播报链路；关闭后仍显示文字。</div>
+                <div class="switch-desc">用大肥鱼的声音读出点评和回答。</div>
               </div>
               <label class="switch">
-                <input type="checkbox" data-change="lobby-voice" ${state.lobby.voice ? 'checked' : ''} ${activeDafeiyu ? '' : 'disabled'} />
+                <input type="checkbox" data-change="lobby-voice" aria-label="语音播报" ${state.lobby.voice ? 'checked' : ''} ${activeDafeiyu ? '' : 'disabled'} />
                 <span class="switch-track"></span>
               </label>
             </div>
@@ -758,30 +799,7 @@ function renderLobby() {
               <button class="btn btn-quiet btn-sm" type="button" data-action="check-health">${icon('refresh', 'icon-sm')} 检测</button>
             </div>
             <div class="fine-print">
-              没有桌宠也能玩：内置机器人和模型配置足以完成对局与回放。
               <button class="btn btn-quiet btn-sm" type="button" data-action="open-dafeiyu-settings">连接设置</button>
-            </div>
-          </section>
-
-          <section class="card start-panel">
-            <div class="start-panel-head">
-              <div>
-                <p class="eyebrow">READY</p>
-                <h3>这桌怎么坐</h3>
-              </div>
-              <span class="chip">${escapeHtml(game.name)}</span>
-            </div>
-            <div class="start-seat-list">${playerLine}</div>
-            <button class="btn btn-primary btn-lg btn-block" type="button" data-action="start-match" ${errors.length ? 'disabled' : ''}>
-              ${icon('play')} 开始对局
-            </button>
-            <button class="btn btn-quiet btn-block mt-8" type="button" data-action="quick-demo">
-              ${icon('bot', 'icon-sm')} 快速试玩：我执${escapeHtml(firstSeat?.name ?? '首座')} vs 内置机器人
-            </button>
-            <div class="start-notes">
-              <div class="start-note"><span class="dot dot-live"></span><span>${allAi ? '全部座位由 AI 控制：开局后可观战、暂停和单步推进。' : '你在自己座位行动，AI 回合自动进行。'}</span></div>
-              <div class="start-note"><span class="dot"></span><span>服务只监听本机，第一次运行不需要网络。</span></div>
-              <div class="start-note"><span class="dot"></span><span>模型 Key 仅保存在后端配置里，网页只能看到“已设置”。</span></div>
             </div>
           </section>
         </aside>
@@ -816,6 +834,7 @@ function renderTestResult(result, { loading = false, title = '' } = {}) {
         <span class="caption" style="margin-left:auto">${detail}</span>
       </div>
       <div class="check-list">${checks}</div>
+      ${result.warning ? `<p class="caption">${escapeHtml(result.warning)}</p>` : ''}
     </div>`;
 }
 
@@ -826,7 +845,7 @@ function renderModelCard(model) {
       <div class="model-head">
         <div>
           <div class="model-sub" style="margin-top:0;margin-bottom:8px">
-            <span class="chip ${model.isExample ? 'chip-gold' : 'chip-accent'}">${model.isExample ? '本地示例' : '模型配置'}</span>
+            ${model.isExample ? '<span class="chip chip-gold">本地示例</span>' : ''}
             <span class="chip">${escapeHtml(model.providerLabel)}</span>
           </div>
           <h2 class="model-name">${escapeHtml(model.name)}</h2>
@@ -838,6 +857,7 @@ function renderModelCard(model) {
         <div class="model-meta-row"><span class="model-meta-label">Base URL</span><span class="model-meta-value">${escapeHtml(model.baseUrl)}</span></div>
         <div class="model-meta-row"><span class="model-meta-label">请求端点</span><span class="model-meta-value">${escapeHtml(model.endpoint)}</span></div>
         <div class="model-meta-row"><span class="model-meta-label">超时 / 重试</span><span class="model-meta-value">${Math.round(Number(model.timeoutMs) / 1000)} 秒 / ${model.maxRetries ?? 2} 次</span></div>
+        <div class="model-meta-row"><span class="model-meta-label">推理 / 单步输出</span><span class="model-meta-value">${escapeHtml((model.reasoning?.label ?? '跟随服务默认'))} / ${Number(model.maxOutputTokens ?? 4800)} tokens</span></div>
         <div class="model-meta-row">
           <span class="model-meta-label">API Key</span>
           <span class="model-key-state ${model.hasApiKey ? 'set' : 'unset'}">${icon(model.hasApiKey ? 'shield' : 'x', 'icon-sm')} ${model.hasApiKey ? '已设置 · 不回传浏览器' : '未设置 / 无 Key'}</span>
@@ -857,9 +877,8 @@ function renderModels() {
   const content = `
     <div class="page">
       ${renderPageHead({
-        eyebrow: 'MODEL CONNECTIONS',
         title: '模型管理',
-        subtitle: '竞技场在后端直连 OpenAI 兼容接口。API Key 只保存在本机配置文件中，配置读取、对局记录、日志和回放导出都不会返回它。',
+        subtitle: '管理本地模型、云端 API 和大肥鱼的连接。',
         actions: `<button class="btn" type="button" data-action="refresh-models">${icon('refresh')} 刷新</button>
           <button class="btn btn-primary" type="button" data-action="create-model">${icon('plus')} 新增模型</button>`,
       })}
@@ -868,7 +887,7 @@ function renderModels() {
           <div class="section-head">
             <div>
               <h2 class="section-title">${icon('cpu')} 已保存的接口</h2>
-              <p class="section-note">${state.models.length} 个配置。同一局的两个 AI 座位可以指向不同供应商或本机模型。</p>
+              <p class="section-note">${state.models.length} 个已保存配置</p>
             </div>
             <span class="chip">${icon('shield', 'icon-sm')} Key 后端持有</span>
           </div>
@@ -938,14 +957,16 @@ async function loadModelsData() {
 
 async function handleRoute() {
   const route = parseRoute();
-  const previous = state.route;
-  if (previous?.name === 'match'
-    && (route.name !== 'match' || route.id !== previous.id)
-    && state.match?.id === previous.id) {
-    releaseMatchSession(previous.id, '离开对局页面');
-  }
-  closeMatchStream();
+  state.monitorStop?.(); state.monitorStop=null;
+  const keepStream=Boolean(state.eventSource && (route.name==='monitor' || (route.name==='match' && route.id===state.streamMatchId)));
+  if(!keepStream)closeMatchStream();
   state.route = route;
+  if(route.name==='monitor'){
+    renderLoading('monitor','正在加载模型监控');
+    try{await loadModelsData();if(state.route!==route)return;const stop=await mountMonitor({api,renderShell,boot:{...state.boot,models:state.models,backgroundMatchId:state.streamMatchId},icon,isCurrent:()=>state.route===route});if(state.route===route)state.monitorStop=stop;else stop?.();}
+    catch(error){renderShell('<div class="page"><div class="notice notice-warn">'+escapeHtml(error.message)+'</div></div>','monitor');}
+    return;
+  }
   if (route.name === 'lobby') {
     renderLobby();
     return;
@@ -971,11 +992,11 @@ async function handleRoute() {
     return;
   }
   if (route.name === 'match') {
-    state.chatDraft = '';
+    if(state.match?.id!==route.id)state.chatDraft = '';
     renderLoading('lobby', '正在载入对局');
     try {
       const data = await api(`/api/matches/${encodeURIComponent(route.id)}`);
-      state.match = data.match;
+      mergeMatchSnapshot(data.match);
       renderMatchPage();
       openMatchStream(route.id);
     } catch (error) {
@@ -991,7 +1012,8 @@ async function handleRoute() {
     try {
       const replay = await api(`/api/matches/${encodeURIComponent(route.id)}/replay`);
       state.replay = replay;
-      state.replayStep = replay.totalSteps;
+      const linkedStep=new URLSearchParams(location.hash.split('?')[1]??'').get('step');
+      state.replayStep = linkedStep===null?replay.totalSteps:Math.max(0,Math.min(replay.totalSteps,Number(linkedStep)||0));
       renderReplayPage();
     } catch (error) {
       renderShell(`<div class="page">
@@ -1066,7 +1088,13 @@ function historyResultHtml(match) {
     ?? (['black_win', 'white_win'].includes(match.result) ? 'win' : match.result);
   const label = group === 'win' ? '有胜负' : group === 'draw' ? '和棋' : group === 'aborted' ? '已中止' : (RESULT_LABELS[match.result] ?? match.result ?? '—');
   const cls = group === 'win' ? 'chip-gold' : group === 'aborted' ? 'chip-danger' : group === 'draw' ? '' : 'chip-muted';
-  return `<div class="history-result"><span class="chip ${cls}">${escapeHtml(label)}</span><small>${escapeHtml(match.resultLabel ?? '')}</small></div>`;
+  return `<div class="history-result"><span class="chip ${cls}">${escapeHtml(label)}</span><small>${escapeHtml(displayResultLabel(match.resultLabel))}</small></div>`;
+}
+
+function paceBadge(match) {
+  const timed = match.aiPace === 'fast';
+  return '<span class="chip '+(timed ? 'chip-gold' : 'chip-subtle')+'" data-pace="'+(timed ? 'fast' : 'quality')+'">'
+    + (timed ? '限时模式 · 每手 25 秒' : '正常模式') + '</span>';
 }
 
 function renderHistoryRow(match) {
@@ -1076,8 +1104,9 @@ function renderHistoryRow(match) {
   return `
     <div class="history-row">
       <div class="history-when">
-        <strong>${escapeHtml(match.id)}</strong>
-        ${formatDateTime(match.createdAt)} · ${escapeHtml(match.gameName ?? '桌游')}
+        <strong title="${escapeAttr(match.id)}">${escapeHtml(match.gameName ?? '桌游')}</strong>
+        ${formatDateTime(match.createdAt)}
+        <div class="history-pace">${paceBadge(match)}</div>
       </div>
       <div class="history-players dynamic-history-seats">
         ${order.map((id) => {
@@ -1104,12 +1133,11 @@ function renderHistory() {
   const content = `
     <div class="page">
       ${renderPageHead({
-        eyebrow: 'ARCHIVE',
         title: '对局记录',
-        subtitle: '规则版本、座位、模型名称、逐手动作、公开发言和结果都保存在本机。回放只读取权威快照，不调用模型，也不播放语音。',
+        subtitle: '按桌游、玩家或结果筛选，打开棋谱逐手复盘。',
         actions: `<button class="btn" type="button" data-action="refresh-history">${icon('refresh')} 刷新</button>`,
       })}
-      <section class="card history-shell">
+      <section class="card history-shell" aria-label="对局列表">
         ${historyFiltersHtml()}
         ${state.historyItems.length
           ? `<div class="history-list">${state.historyItems.map(renderHistoryRow).join('')}</div>`
@@ -1147,13 +1175,13 @@ function seatStrip(match, view) {
         <div class="match-seat ${active ? 'active' : ''} ${winner ? 'winner' : ''}" style="--seat-color:${escapeAttr(seatColor(def))}">
           ${seatToken(def)}
           <div class="match-seat-copy">
-            <div class="match-seat-label">${escapeHtml(seat.colorName ?? def.name)} ${seatKindChip(seat)} ${seatModeLabel(seat) ? `<span class="chip chip-subtle">${escapeHtml(seatModeLabel(seat))}</span>` : ''}</div>
+            <div class="match-seat-label">${escapeHtml(def.name)} ${seatKindChip(seat)} ${seatModeLabel(seat) ? `<span class="chip chip-subtle">${escapeHtml(seatModeLabel(seat))}</span>` : ''}</div>
             <div class="match-seat-name">${escapeHtml(seat.name)}</div>
             <div class="match-seat-engine">${escapeHtml(seat.engineLabel)}</div>
           </div>
         </div>`;
     }).join('')}
-    <div class="seat-center"><strong>${match.actionCount ?? view?.moveCount ?? 0}</strong><small>手 / MOVES</small></div>
+    <div class="seat-center"><strong>${match.actionCount ?? view?.moveCount ?? 0}</strong><small>总手数</small></div>
   </div>`;
 }
 
@@ -1291,9 +1319,53 @@ function threeSeatSurface({ match, view, interactive, title = '对局桌面' }) 
  * 后端插件接口、座位、回合、模型调用、事件与回放不需要跟着复制。
  * 未注册时仍会显示一个只读的通用局面摘要，保证历史不会打不开。
  */
+const splendorViews = new Map();
+
+function splendorView(match, publicView) {
+  if (!match.controls?.humanSeat || !['playing','paused'].includes(match.status)) return publicView;
+  const cached = splendorViews.get(match.id);
+  if (cached?.step === match.actionCount) return cached.view?.state ?? publicView;
+  const request = { step: match.actionCount, view: null };
+  splendorViews.clear();
+  splendorViews.set(match.id, request);
+  const url = '/api/matches/' + encodeURIComponent(match.id) + '/human-view';
+  void fetch(url, { headers: { 'X-Arena-Human-View': '1' }, cache: 'no-store' })
+    .then(response => { if (!response.ok) throw Error(String(response.status)); return response.json(); })
+    .then(({ view }) => {
+      if (splendorViews.get(match.id) !== request || view?.step !== request.step) return;
+      request.view = view;
+      if (routeIs('match', match.id)) updateMatchView();
+    }).catch(() => {
+      if (splendorViews.get(match.id) === request) splendorViews.delete(match.id);
+    });
+  return publicView;
+}
+
+const reservationViews=new Map();
+function splendorReservations(context){
+  if(context.replay)return publicReservations((state.replay?.steps??[]).slice(0,state.replayStep+1));
+  const match=context.match,step=match.actionCount??0;
+  const cached=reservationViews.get(match.id);
+  if(cached?.step===step)return cached.value;
+  const request={step,value:null};reservationViews.clear();reservationViews.set(match.id,request);
+  void api('/api/matches/'+encodeURIComponent(match.id)+'/replay?limit='+step).then(replay=>{
+    if(reservationViews.get(match.id)!==request)return;
+    request.value=publicReservations(replay.steps??[]);
+    if(routeIs('match',match.id))updateMatchView();
+  }).catch(()=>{});
+  return null;
+}
+
 const GAME_SURFACES = {
+  splendor: context => renderSplendor({ ...context, reservedView:splendorReservations(context), view: context.replay ? context.view : splendorView(context.match, context.view) }, escapeHtml, escapeAttr),
   gomoku: (context) => boardCard(context),
   'three-seat-test': (context) => threeSeatSurface(context),
+  'blokus-duo': (context) => renderBlokusDuoSurface(context, {
+    escapeHtml,
+    escapeAttr,
+    icon,
+    seatColor: (def) => seatColor(def),
+  }),
 };
 
 function renderGenericGameSurface({ match, view, title = '局面' }) {
@@ -1316,7 +1388,9 @@ function renderGameSurface(context) {
 function matchStatusBanner(match) {
   const pending = match.pending;
   const current = match.turnSeat ?? match.state?.turn;
-  const currentName = match.turnSeatName ?? match.seats?.[current]?.colorName ?? match.seats?.[current]?.name ?? '当前席位';
+  const currentName = match.turnSeatName
+    ? (match.gameId === 'blokus-duo' && match.turnSeatName === '金方' ? '红方' : match.turnSeatName)
+    : seatDisplayName(match, current);
   let cls = 'playing';
   let title = '对局进行中';
   let desc = '按座位顺序行动。';
@@ -1332,7 +1406,7 @@ function matchStatusBanner(match) {
   } else if (match.status === 'finished') {
     cls = 'finished';
     iconName = 'flag';
-    title = match.resultLabel ?? '对局结束';
+    title = displayResultLabel(match.resultLabel) || '对局结束';
     desc = match.outcome?.type === 'win'
       ? (match.outcome.length
         ? `${match.winnerName ?? currentName} 以 ${match.outcome.move ?? match.lastActionText ?? '最后一手'} 完成 ${match.outcome.length} 子连线，可以复盘或导出记录。`
@@ -1356,6 +1430,10 @@ function matchStatusBanner(match) {
         : pending.kind === 'model'
           ? '正在等待模型返回结构化动作。暂停或结束后，迟到的回复会作废。'
           : '内置机器人正在按规则选择动作。';
+      if (pending.kind !== 'bot') {
+        desc += ' 尝试 ' + pending.attempt + '/' + (pending.maxAttempts ?? 1);
+        if (pending.deadlineAt) desc += ' · 限时模式每手上限 25 秒';
+      }
       side = `<span class="status-pill connecting"><span class="dot dot-warn"></span>AI 行动中</span>`;
     } else if (match.controls?.isHumanTurn) {
       title = '轮到你行动';
@@ -1490,7 +1568,7 @@ function renderDafeiyuCard(match) {
                 <div class="switch-desc">${seatBound ? '从自己的座位视角短评；轮到自己落子时点评自动让位。' : '从双方视角点评，带冷却和事件去重。'}</div>
               </div>
               <label class="switch">
-                <input type="checkbox" data-change="match-auto" ${dafeiyu.autoComment ? 'checked' : ''} ${archived ? 'disabled' : ''} />
+                <input type="checkbox" data-change="match-auto" aria-label="自动点评" ${dafeiyu.autoComment ? 'checked' : ''} ${archived ? 'disabled' : ''} />
                 <span class="switch-track"></span>
               </label>
             </div>
@@ -1500,7 +1578,7 @@ function renderDafeiyuCard(match) {
                 <div class="switch-desc">${dafeiyu.voice ? '文字照常显示，语音由桌宠队列播放。' : '只显示文字，不请求桌宠语音。关闭时会取消仍在等待的旧播报。'}</div>
               </div>
               <label class="switch">
-                <input type="checkbox" data-change="match-voice" ${dafeiyu.voice ? 'checked' : ''} ${archived ? 'disabled' : ''} />
+                <input type="checkbox" data-change="match-voice" aria-label="语音播报" ${dafeiyu.voice ? 'checked' : ''} ${archived ? 'disabled' : ''} />
                 <span class="switch-track"></span>
               </label>
             </div>
@@ -1560,9 +1638,24 @@ function renderChatCard(match) {
           ${state.askBusy ? '<span class="spinner"></span>' : icon('send')}
         </button>
       </form>
+      <label class="checkline chat-analysis"><input type="checkbox" data-change="deep-analysis" ${state.deepAnalysis?'checked':''} />深入分析（本次提问开启思考）</label>
       <div class="chat-disabled" id="chat-disabled" ${canAsk ? 'hidden' : ''}>${escapeHtml(disabledReason)}</div>
     </section>
   `;
+}
+
+function modelMetricsText(action) {
+  const metadata = action.modelMeta ?? {};
+  const usage = metadata.tokenUsage;
+  const timing = metadata.requestTiming;
+  const fields = [];
+  if (metadata.modelId) fields.push(metadata.modelId);
+  if (Number.isFinite(action.metrics?.elapsedMs)) fields.push('总耗时 ' + (action.metrics.elapsedMs / 1000).toFixed(2) + ' 秒');
+  if (Number.isFinite(timing?.firstOutputMs)) fields.push('首输出（含思考）' + (timing.firstOutputMs / 1000).toFixed(2) + ' 秒');
+  if (Number.isFinite(usage?.promptTokens)) fields.push('输入 ' + usage.promptTokens + ' tokens');
+  if (Number.isFinite(usage?.completionTokens)) fields.push('输出（含思考）' + usage.completionTokens + ' tokens');
+  if (Number.isFinite(usage?.reasoningTokens)) fields.push('思考 ' + usage.reasoningTokens + ' tokens');
+  return fields.join(' · ');
 }
 
 function renderControlsCard(match) {
@@ -1594,8 +1687,9 @@ function renderControlsCard(match) {
             <button class="btn btn-danger btn-wide" type="button" data-action="end-match">${icon('flag', 'icon-sm')} 结束对局</button>
           `}
         </div>
+        ${!paused && !terminal ? `<button class="btn btn-quiet btn-wide" data-action="pause-after-move" ${match.pending?.pauseAfterMove?'disabled':''}>${match.pending?.pauseAfterMove?'当前步完成后暂停':'暂停对局后聊天（保留当前步）'}</button>` : ''}
         ${paused && controls.canRetry ? `<p class="control-footnote">重试会清除暂停原因，并在当前回合重新请求 AI；迟到回复不会改变棋盘。</p>` : ''}
-        ${!paused && !terminal && controls.allAi ? `<p class="control-footnote">全 AI 对局可暂停后单步推进。离开对局页会释放大肥鱼会话；有棋手座的棋局会暂停，回来后可重连接续。</p>` : ''}
+        ${!paused && !terminal && controls.allAi ? `<p class="control-footnote">全 AI 对局可暂停后单步推进。切到监控可继续后台对局；离开对局和监控页会释放会话并暂停棋手局。</p>` : ''}
         ${['dafeiyu_disconnected', 'page_left'].includes(match.pause?.code) ? `<div class="notice notice-warn mt-12">${icon('alert')}<span>${match.pause?.code === 'page_left' ? '已离开对局页，大肥鱼会话释放。返回后先重新连接，再按“继续”。' : '大肥鱼棋手掉线，重连成功后按“继续”恢复。'}</span></div>` : ''}
         ${(match.errors ?? []).length ? `
           <details class="rules-details">
@@ -1606,12 +1700,12 @@ function renderControlsCard(match) {
           </details>
         ` : ''}
         <details class="rules-details">
-          <summary>逐手指标（耗时 / 尝试 / 失败类型）</summary>
+          <summary>逐手指标与模型用量</summary>
           <div class="error-list">
             ${(match.actions ?? []).slice(-10).reverse().map((action) => `
               <div class="error-entry">
                 <span class="code">#${action.index} ${escapeHtml(match.seats[action.seat]?.colorName ?? action.seat)}</span>
-                <span>${escapeHtml(action.text ?? action.action?.move ?? action.action?.cell ?? '—')} · ${action.metrics?.elapsedMs ?? 0}ms · ${action.metrics?.attempts ?? 1} 次${(action.metrics?.failures ?? []).length ? ` · ${escapeHtml((action.metrics.failures ?? []).map((item) => item.code).join(', '))}` : ''}</span>
+                <span>${escapeHtml(action.text ?? action.action?.move ?? action.action?.cell ?? '—')} · ${escapeHtml(modelMetricsText(action))} · 尝试 ${action.metrics?.attempts ?? 1} 次${(action.metrics?.failures ?? []).length ? ` · ${escapeHtml((action.metrics.failures ?? []).map((item) => item.code).join(', '))}` : ''}</span>
               </div>`).join('') || '<div class="caption">还没有动作。</div>'}
           </div>
         </details>
@@ -1640,22 +1734,23 @@ function renderTopMatchControls(match) {
 
 function matchMetaHtml(match) {
   return `
-    <span>${escapeHtml(match.id)}</span><span class="sep">/</span>
-    <span>规则 v${escapeHtml(match.rulesVersion)}</span><span class="sep">/</span>
-    <span>${formatDateTime(match.createdAt)}</span>
+    <span>${escapeHtml(match.modeLabel ?? '')}</span><span class="sep">·</span>
+    <span title="${escapeAttr(match.id)}">${formatDateTime(match.createdAt)}</span>
     ${state.sseState === 'reconnecting' ? '<span class="sep">/</span><span class="chip chip-danger js-sse-chip">实时连接重试中</span>' : ''}`;
 }
 
 function matchTitleChips(match) {
   return `
     ${statusPill(match.status)}
+    ${paceBadge(match)}
     ${match.dafeiyu?.enabled ? `<span class="chip chip-gold">${icon('spark', 'icon-sm')} ${match.dafeiyu.playerSeat ? '大肥鱼执棋' : '大肥鱼观战'}</span>` : ''}`;
 }
 
 function matchActionsHtml(match) {
   return `
     ${renderTopMatchControls(match)}
-    <a class="btn btn-sm" href="/api/matches/${encodeURIComponent(match.id)}/export" download>${icon('download', 'icon-sm')} 导出记录</a>
+    <a class="btn btn-sm" href="#/monitor?match=${encodeURIComponent(match.id)}">${icon('clock', 'icon-sm')} 本局耗时</a>
+          <a class="btn btn-sm" href="/api/matches/${encodeURIComponent(match.id)}/export" download>${icon('download', 'icon-sm')} 导出记录</a>
     ${match.status === 'finished' || match.status === 'aborted' ? `<a class="btn btn-sm btn-gold" href="#/replay/${encodeURIComponent(match.id)}">${icon('history', 'icon-sm')} 回放</a>` : ''}`;
 }
 
@@ -1698,12 +1793,12 @@ function renderMatchPage() {
   const canPlay = Boolean(match.controls?.isHumanTurn && !match.pending && match.status === 'playing' && !state.actionBusy);
   const humanSeat = Object.values(match.seats).find((seat) => seat.kind === 'human');
   const humanColor = match.controls?.humanSeat ?? humanSeat?.id ?? null;
+  const markup = renderGameSurface({ match, view, interactive: canPlay, humanColor, title: '对局桌面' });
   const content = `
     <div class="page match-page">
       <a class="back-link" href="#/history">${icon('arrowLeft')} 对局记录</a>
       <div class="match-topbar">
         <div>
-          <div class="eyebrow" id="match-eyebrow">LIVE TABLE · ${escapeHtml(match.modeLabel ?? '')}</div>
           <div class="match-title-row">
             <h1 class="match-title">${escapeHtml(match.gameName)}</h1>
             <span id="match-title-chips">${matchTitleChips(match)}</span>
@@ -1715,7 +1810,9 @@ function renderMatchPage() {
       <div id="match-status">${matchStatusBanner(match)}</div>
       <div id="match-seats">${seatStrip(match, view)}</div>
       <div class="match-layout">
-        <div id="match-surface">${renderGameSurface({ match, view, interactive: canPlay, humanColor, title: '对局桌面' })}</div>
+        <div class="match-main-column"><div id="match-surface">${markup}</div>
+            <section class="side-card match-inline-time"><details open><summary class="side-card-head"><span class="side-card-title">${icon('clock','icon-sm')} 本局步耗时</span><span class="caption">随落子更新</span></summary><div class="side-card-body" id="match-time-view">${renderInlineMatchTiming(match)}</div></details></section>
+          </div>
         <div class="side-column">
           <div id="match-dafeiyu">${renderDafeiyuCard(match)}</div>
           ${renderChatCard(match)}
@@ -1725,6 +1822,8 @@ function renderMatchPage() {
     </div>`;
   state.matchShellId = match.id;
   renderShell(content, 'lobby');
+  const surface = document.querySelector('#match-surface');
+  if (surface) matchSurfaceMarkup.set(surface, markup);
   syncChatForm(match);
   requestAnimationFrame(() => {
     const log = document.querySelector('#chat-log');
@@ -1732,6 +1831,9 @@ function renderMatchPage() {
     updateSseChip();
   });
 }
+
+const matchSurfaceMarkup = new WeakMap();
+const inlineTimingMarkup = new WeakMap();
 
 function updateMatchView() {
   const match = state.match;
@@ -1744,7 +1846,9 @@ function updateMatchView() {
     renderMatchPage();
     return;
   }
-  const focused = document.activeElement;
+  const surface = document.querySelector('#match-surface');
+  const focused = surface?.contains(document.activeElement) ? document.activeElement : null;
+  const previousTrayScroll = surface?.querySelector('.blokus-tray')?.scrollTop ?? 0;
   const focusedCoord = focused?.dataset?.coord ?? null;
   const focusedCell = focused?.dataset?.cell ?? null;
   const chatLog = document.querySelector('#chat-log');
@@ -1757,15 +1861,35 @@ function updateMatchView() {
     const element = document.querySelector(selector);
     if (element) element.innerHTML = html;
   };
-  set('#match-eyebrow', `LIVE TABLE · ${escapeHtml(match.modeLabel ?? '')}`);
   set('#match-title-chips', matchTitleChips(match));
   set('#match-meta', matchMetaHtml(match));
   set('#match-actions', matchActionsHtml(match));
   set('#match-status', matchStatusBanner(match));
   set('#match-seats', seatStrip(match, view));
-  set('#match-surface', renderGameSurface({ match, view, interactive: canPlay, humanColor: match.controls?.humanSeat ?? null, title: '对局桌面' }));
+  if (surface) {
+    const markup = renderGameSurface({ match, view, interactive: canPlay, humanColor: match.controls?.humanSeat ?? null, title: '对局桌面' });
+    if (matchSurfaceMarkup.get(surface) !== markup) {
+      surface.innerHTML = markup;
+      matchSurfaceMarkup.set(surface, markup);
+    }
+  }
   set('#match-dafeiyu', renderDafeiyuCard(match));
   set('#match-controls', renderControlsCard(match));
+  const timing=document.querySelector('#match-time-view');
+  if(timing){
+    const html=renderInlineMatchTiming(match);
+    if(inlineTimingMarkup.get(timing)!==html){
+      const chart=timing.querySelector('.monitor-chart-scroll'),table=timing.querySelector('.match-inline-table');
+      const chartLeft=chart?.scrollLeft??0,tableLeft=table?.scrollLeft??0,tableTop=table?.scrollTop??0;
+      const atBottom=!table||table.scrollHeight-table.scrollTop-table.clientHeight<40;
+      const expanded=timing.querySelector('.match-inline-details')?.open??false;
+      timing.innerHTML=html;inlineTimingMarkup.set(timing,html);
+      const nextChart=timing.querySelector('.monitor-chart-scroll'),nextTable=timing.querySelector('.match-inline-table');
+      if(nextChart)nextChart.scrollLeft=chartLeft;
+      if(nextTable){nextTable.scrollLeft=tableLeft;nextTable.scrollTop=atBottom?nextTable.scrollHeight:tableTop;}
+      if(timing.querySelector('.match-inline-details'))timing.querySelector('.match-inline-details').open=expanded;
+    }
+  }
   const count = document.querySelector('#chat-count');
   if (count) count.textContent = String((match.chat ?? []).length);
   const log = document.querySelector('#chat-log');
@@ -1774,20 +1898,25 @@ function updateMatchView() {
   });
   syncChatForm(match);
   if (log) log.scrollTop = chatAtBottom ? log.scrollHeight : previousChatScroll;
-  if (focusedCoord) {
-    const next = document.querySelector(`[data-coord="${CSS.escape(focusedCoord)}"]`);
-    if (next && !next.disabled) next.focus();
-    else document.querySelector('.board-surface')?.focus();
-  } else if (focusedCell) {
-    const next = document.querySelector(`[data-cell="${CSS.escape(focusedCell)}"]`);
-    if (next && !next.disabled) next.focus();
-    else document.querySelector('.three-seat-grid')?.focus();
+  const tray = surface?.querySelector('.blokus-tray');
+  if (tray) tray.scrollTop = previousTrayScroll;
+  if (focused && !focused.isConnected) {
+    const playArea = surface.querySelector('.blokus-board, .board-surface, .three-seat-grid');
+    const action = focused.dataset.action;
+    let next;
+    if (focusedCoord) next = surface.querySelector('[data-coord="' + CSS.escape(focusedCoord) + '"]');
+    else if (focusedCell) next = surface.querySelector('[data-cell="' + CSS.escape(focusedCell) + '"]');
+    else if (action === 'blokus-piece') next = tray?.querySelector('[data-piece="' + CSS.escape(focused.dataset.piece) + '"]');
+    else if (action?.startsWith('blokus-')) next = surface.querySelector('[data-action="' + CSS.escape(action) + '"]');
+    (next && !next.disabled ? next : playArea)?.focus({ preventScroll: true });
   }
   updateSseChip();
 }
 
 function openMatchStream(id) {
+  if(state.eventSource && state.streamMatchId===id && state.eventSource.readyState!==EventSource.CLOSED){updateSseChip();return;}
   closeMatchStream();
+  state.streamMatchId=id;
   state.sseState = 'connecting';
   const source = new EventSource(`/api/matches/${encodeURIComponent(id)}/events`);
   state.eventSource = source;
@@ -1833,26 +1962,7 @@ function closeMatchStream() {
     state.eventSource = null;
   }
   state.sseState = null;
-}
-
-function releaseMatchSession(matchId, reason = '离开对局页面') {
-  if (!matchId) return;
-  const payload = JSON.stringify({ reason });
-  try {
-    const sent = navigator.sendBeacon?.(
-      `/api/matches/${encodeURIComponent(matchId)}/leave`,
-      new Blob([payload], { type: 'application/json' }),
-    );
-    if (sent) return;
-  } catch {
-    // 回退到 fetch keepalive。
-  }
-  void fetch(`/api/matches/${encodeURIComponent(matchId)}/leave`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: payload,
-    keepalive: true,
-  }).catch(() => {});
+  state.streamMatchId = null;
 }
 
 function renderReplayPage() {
@@ -1872,20 +1982,19 @@ function renderReplayPage() {
       <a class="back-link" href="#/history">${icon('arrowLeft')} 对局记录</a>
       <div class="match-topbar">
         <div>
-          <div class="eyebrow">REPLAY · READ ONLY</div>
           <div class="match-title-row">
             <h1 class="match-title">${escapeHtml(match.gameName)} · 回放</h1>
-            <span class="chip chip-gold">${escapeHtml(replay.resultLabel ?? '已结束')}</span>
+            <span class="chip chip-gold">${escapeHtml(displayResultLabel(replay.resultLabel) || '已结束')}</span>
+            ${paceBadge({ aiPace: replay.aiPace ?? match.aiPace })}
           </div>
           <div class="match-meta-line">
-            <span>${escapeHtml(match.id)}</span><span class="sep">/</span>
-            <span>规则 v${escapeHtml(match.rulesVersion)}</span><span class="sep">/</span>
+            <span title="${escapeAttr(match.id)}">${formatDateTime(match.createdAt)}</span><span class="sep">·</span>
+            <span>规则 v${escapeHtml(match.rulesVersion)}</span><span class="sep">·</span>
             <span>共 ${replay.totalSteps} 手</span>
-            <span class="sep">/</span>
-            <span>权威快照 · 不调用模型</span>
           </div>
         </div>
         <div class="match-actions">
+          <a class="btn btn-sm" href="#/monitor?match=${encodeURIComponent(match.id)}">${icon('clock', 'icon-sm')} 本局耗时</a>
           <a class="btn btn-sm" href="/api/matches/${encodeURIComponent(match.id)}/export" download>${icon('download', 'icon-sm')} 导出记录</a>
           <a class="btn btn-sm btn-primary" href="#/lobby">${icon('plus', 'icon-sm')} 新对局</a>
         </div>
@@ -1894,7 +2003,7 @@ function renderReplayPage() {
         <div class="match-status-banner finished">
           <div class="match-status-icon">${icon('flag')}</div>
           <div class="match-status-copy">
-            <div class="match-status-title">${escapeHtml(replay.resultLabel ?? '对局结束')}</div>
+            <div class="match-status-title">${escapeHtml(displayResultLabel(replay.resultLabel) || '对局结束')}</div>
             <div class="match-status-desc">${currentOutcome.type === 'win' ? `获胜${currentOutcome.length ? `连线 ${currentOutcome.length} 子` : `落点 ${currentOutcome.move ?? currentOutcome.cell ?? '—'}`}。` : currentOutcome.type === 'draw' ? '规则判定和棋。' : escapeHtml(currentOutcome.reason ?? '对局中止。')}</div>
           </div>
           <div class="match-status-side"><span class="chip">${step} / ${replay.totalSteps} 手</span></div>
@@ -1903,7 +2012,7 @@ function renderReplayPage() {
           <div class="match-status-icon">${icon('history')}</div>
           <div class="match-status-copy">
             <div class="match-status-title">正在复盘第 ${step} 手${step === 0 ? ' · 初始局面' : ''}</div>
-            <div class="match-status-desc">${step === 0 ? '尚未落子。按“下一手”开始；可拖拽时间轴跳到任意回合。' : `上一手：${escapeHtml(current.actionText ?? currentMove?.move ?? currentMove?.cell ?? '—')} · ${escapeHtml(match.seats[current.seat]?.colorName ?? match.seats[current.seat]?.name ?? '')}`}</div>
+            <div class="match-status-desc">${step === 0 ? '尚未落子。按“下一手”开始；可拖拽时间轴跳到任意回合。' : `上一手：${escapeHtml(current.actionText ?? currentMove?.move ?? currentMove?.cell ?? '—')} · ${escapeHtml(match.seats[current.seat]?.colorName ?? match.seats[current.seat]?.name ?? '')}${current.source ? ` · ${escapeHtml(current.sourceName ?? ({ human: '真人', model: '模型', bot: '内置机器人', dafeiyu: '大肥鱼', system: '系统' }[current.source] ?? current.source))}` : ''}`}</div>
           </div>
           <div class="match-status-side"><span class="chip">${step} / ${replay.totalSteps} 手</span></div>
         </div>`}
@@ -1926,9 +2035,11 @@ function renderReplayPage() {
           <button class="btn btn-sm" type="button" data-action="replay-last" ${step >= replay.totalSteps ? 'disabled' : ''}>终局</button>
         </div>
       </section>
+      ${step > 0 && current.actionText ? `<div class="notice notice-info replay-action-detail">${icon('history', 'icon-sm')}<span>本手动作：<strong>${escapeHtml(current.actionText)}</strong> · 来源：${escapeHtml(current.sourceName ?? ({ human: '真人', model: '模型', bot: '内置机器人', dafeiyu: '大肥鱼', system: '系统' }[current.source] ?? current.source ?? '未知'))}${current.modelMeta?.candidateInfo ? ` · 候选 ${current.modelMeta.candidateInfo.shown}/${current.modelMeta.candidateInfo.total}（${escapeHtml(current.modelMeta.candidateInfo.filter ?? '')}）` : ''}</span></div>` : ''}
+      ${step > 0 && modelMetricsText(current) ? `<p class="caption replay-model-metrics">${escapeHtml(modelMetricsText(current))}</p>` : ''}
       <div class="replay-layout">
         <div>
-          ${renderGameSurface({ match, view, interactive: false, humanColor: null, title: '历史棋盘' })}
+          ${renderGameSurface({ match, view, interactive: false, humanColor: null, title: '历史棋盘', replay: true })}
         </div>
         <aside class="replay-side">
           <section class="side-card replay-chat">
@@ -1940,11 +2051,11 @@ function renderReplayPage() {
           </section>
           <section class="card replay-info">
             <h3>这一局</h3>
-            <p>${escapeHtml(replay.modeLabel ?? '')}<br />${formatFullDate(match.createdAt)} · 规则 v${escapeHtml(match.rulesVersion)}<br />最终结果：${escapeHtml(replay.resultLabel ?? '—')}</p>
+            <p>${escapeHtml(replay.modeLabel ?? '')}<br />${formatFullDate(match.createdAt)} · 规则 v${escapeHtml(match.rulesVersion)}<br />最终结果：${escapeHtml(displayResultLabel(replay.resultLabel) || '—')}</p>
             <div class="replay-outcome">
               ${icon(finalOutcome?.type === 'win' ? 'flag' : 'history')}
               <div>
-                <strong>${escapeHtml(replay.resultLabel ?? '对局结束')}</strong>
+                <strong>${escapeHtml(displayResultLabel(replay.resultLabel) || '对局结束')}</strong>
                 <small>${escapeHtml(step === replay.totalSteps ? '当前在终局' : '按“终局”跳到最后一手')}</small>
               </div>
             </div>
@@ -1963,8 +2074,20 @@ function renderReplayPage() {
 function setReplayStep(value) {
   if (!state.replay) return;
   const step = Math.max(0, Math.min(Number(value) || 0, state.replay.totalSteps));
+  const focused = document.activeElement;
+  const control = focused?.closest('.replay-toolbar') ? focused : null;
+  const id = control?.id;
+  const action = control?.dataset.action;
+  const change = control?.dataset.change;
   state.replayStep = step;
   renderReplayPage();
+  const replacement = id ? document.getElementById(id)
+    : action ? document.querySelector(`.replay-toolbar [data-action="${action}"]`)
+      : change ? document.querySelector(`.replay-toolbar [data-change="${change}"]`)
+        : control ? document.querySelector('.replay-toolbar [data-form="replay-jump"] button') : null;
+  if (replacement?.disabled) {
+    document.querySelector('.replay-toolbar .step-range')?.focus({ preventScroll: true });
+  } else replacement?.focus({ preventScroll: true });
 }
 
 function openModal(html) {
@@ -2064,6 +2187,12 @@ function modelFormHtml(model = null) {
                 <span class="field-label">非法动作重试次数</span>
                 <input class="input input-mono" name="maxRetries" type="number" min="0" max="5" step="1" value="${escapeAttr(model?.maxRetries ?? 2)}" />
               </label>
+              ${reasoningFields(model)}
+              <label class="field">
+                <span class="field-label">单步输出上限（tokens）</span>
+                <input class="input input-mono" name="maxOutputTokens" type="number" min="256" max="131072" step="1" value="${escapeAttr(model?.maxOutputTokens ?? 4800)}" />
+                <span class="field-hint">推理与最终 JSON 共享此上限；增大可减少截断，但会更慢/更贵。</span>
+              </label>
               <div class="span-2">
                 ${model?.hasApiKey ? `<label class="checkline"><input type="checkbox" name="clearKey" /> 清除已保存的 API Key（保存后不再发送 Authorization）</label>` : ''}
                 <label class="checkline mt-8"><input type="checkbox" name="isExample" ${model?.isExample ? 'checked' : ''} /> 标记为示例配置（仅界面提示，不影响调用）</label>
@@ -2081,9 +2210,34 @@ function modelFormHtml(model = null) {
       </div>`;
 }
 
+function reasoningFields(model) {
+  const adapter=model?.reasoningAdapter??'auto';
+  const thinking=model?.thinkingMode??(model?.reasoningEffort==='off'?'off':'default');
+  return `<label class="field"><span class="field-label">模型推理协议</span><select class="select" name="reasoningAdapter" data-change="reasoning-profile">${Object.entries(state.boot.reasoningProfiles??{}).map(([value,p])=>`<option value="${value}" ${adapter===value?'selected':''}>${escapeHtml(p.label)}</option>`).join('')}</select></label>
+    <label class="field"><span class="field-label">思考开关</span><select class="select" name="thinkingMode" data-change="reasoning-profile">${[['default','跟随服务默认'],['off','关闭思考'],['on','开启思考']].map(([v,label])=>`<option value="${v}" ${thinking===v?'selected':''}>${label}</option>`).join('')}</select></label>
+    <label class="field"><span class="field-label">原生强度／引擎扩展</span><select class="select" name="reasoningEffort" data-change="reasoning-profile"><option value="${escapeAttr(model?.reasoningEffort??'default')}" selected>${escapeHtml(model?.reasoningEffort??'default')}</option></select></label>
+    <div class="field span-2"><span class="caption" id="reasoning-preview">正在识别支持项…</span></div>`;
+}
+let reasoningPreviewEpoch=0;
+async function syncReasoningForm(){
+  const form=modalRoot.querySelector('form[data-form="model"]');if(!form)return;
+  const epoch=++reasoningPreviewEpoch;
+  const values=new FormData(form);
+  try{
+    const result=await api('/api/models/reasoning-preview',{method:'POST',body:{baseUrl:values.get('baseUrl'),modelId:values.get('modelId'),reasoningAdapter:values.get('reasoningAdapter'),thinkingMode:values.get('thinkingMode'),reasoningEffort:values.get('reasoningEffort')}});
+    if(epoch!==reasoningPreviewEpoch||!form.isConnected)return;
+    const effortSelect=form.elements.reasoningEffort;
+    effortSelect.innerHTML=result.profile.efforts.map(value=>`<option value="${value}" ${result.reasoning.effort===value?'selected':''}>${value==='default'?'默认':escapeHtml(value)}</option>`).join('');
+    effortSelect.disabled=result.profile.efforts.length===1||form.elements.thinkingMode.value==='off';
+    form.elements.thinkingMode.disabled=result.reasoning.adapter==='auto';
+    form.querySelector('#reasoning-preview').textContent=result.profile.label+' · '+result.reasoning.label+'。按请求发送，不修改后台默认值；已开局棋手沿用开局配置。'+(result.reasoning.legacyIgnoredEffort?'旧配置中的 '+result.reasoning.legacyIgnoredEffort+' 不属于此模型的已确认档位。':'');
+  }catch(error){if(form.isConnected)form.querySelector('#reasoning-preview').textContent=error.message;}
+}
+
 function openModelForm(model = null) {
   state.modalResolve = null;
   openModal(modelFormHtml(model));
+  void syncReasoningForm();
 }
 
 function dafeiyuFormHtml(config) {
@@ -2120,6 +2274,10 @@ function dafeiyuFormHtml(config) {
                 <span class="field-label">请求 Origin</span>
                 <input class="input input-mono" name="origin" value="${escapeAttr(config?.origin ?? '')}" placeholder="留空使用竞技场监听地址" spellcheck="false" />
               </label>
+              <label class="field"><span class="field-label">大肥鱼棋手 · 思考开关</span><select class="select" name="moveThinkingMode">${[['off','关闭思考'],['on','开启思考'],['default','跟随服务默认']].map(([value,label])=>`<option value="${value}" ${(config?.moveThinkingMode??'off')===value?'selected':''}>${label}</option>`).join('')}</select><span class="field-hint">仅影响棋手，聊天与自动点评仍关闭思考。</span></label>
+              <label class="field"><span class="field-label">棋手输出上限（含思考）</span><input class="input" name="moveMaxOutputTokens" type="number" min="256" max="32768" value="${config?.moveMaxOutputTokens??8192}" /></label>
+              <label class="field"><span class="field-label">棋手推理协议</span><select class="select" name="moveReasoningAdapter"><option value="qwen" ${config?.moveReasoningAdapter!=='kvmem'?'selected':''}>Qwen 原生思考开关</option><option value="kvmem" ${config?.moveReasoningAdapter==='kvmem'?'selected':''}>KVMem 引擎扩展</option></select></label>
+              <label class="field"><span class="field-label">KVMem 引擎扩展强度</span><select class="select" name="moveReasoningEffort">${['default','low','medium','high'].map(value=>`<option value="${value}" ${(config?.moveReasoningEffort??'default')===value?'selected':''}>${value}</option>`).join('')}</select><span class="field-hint">仅选择 KVMem 协议时发送；Qwen 模式不发送强度。</span></label>
               <div class="span-2">
                 ${config?.hasToken ? `<label class="checkline"><input type="checkbox" name="clearToken" /> 清除已保存的桌宠接入令牌</label>` : ''}
               </div>
@@ -2150,6 +2308,10 @@ function collectModelForm(form) {
     modelId: String(data.get('modelId') ?? '').trim(),
     timeoutMs: Number(data.get('timeoutMs')),
     maxRetries: Number(data.get('maxRetries')),
+    reasoningEffort: String(data.get('reasoningEffort') ?? 'default'),
+    reasoningAdapter: String(data.get('reasoningAdapter') ?? 'auto'),
+    thinkingMode: String(data.get('thinkingMode') ?? 'default'),
+    maxOutputTokens: Number(data.get('maxOutputTokens')),
     isExample: data.get('isExample') === 'on',
   };
   const keyValue = String(data.get('apiKey') ?? '');
@@ -2221,6 +2383,10 @@ async function saveDafeiyu(form) {
     apiBase: String(data.get('apiBase') ?? '/api/game/arena').trim(),
     timeoutMs: Number(data.get('timeoutMs')),
     origin: String(data.get('origin') ?? '').trim(),
+    moveThinkingMode:String(data.get('moveThinkingMode')??'off'),
+    moveReasoningAdapter:String(data.get('moveReasoningAdapter')??'qwen'),
+    moveReasoningEffort:String(data.get('moveReasoningEffort')??'default'),
+    moveMaxOutputTokens:Number(data.get('moveMaxOutputTokens')??8192),
   };
   const token = String(data.get('token') ?? '');
   if (token) body.token = token;
@@ -2273,6 +2439,8 @@ async function startMatch({ quick = false } = {}) {
   }
   const payload = {
     gameId: game.id,
+    ...(game.variableSeats ? { playerCount: Object.keys(seats).length } : {}),
+    aiPace: state.lobby.aiPace ?? 'quality',
     seats,
     dafeiyu: {
       enabled: state.lobby.observer || hasSeat,
@@ -2280,8 +2448,8 @@ async function startMatch({ quick = false } = {}) {
       voice: state.lobby.voice,
     },
   };
-  const button = document.querySelector('[data-action="start-match"]');
-  setButtonBusy(button, true);
+  const buttons = [...document.querySelectorAll('[data-action="start-match"], [data-action="quick-demo"]')];
+  buttons.forEach(button => setButtonBusy(button, true));
   try {
     const result = await api('/api/matches', { method: 'POST', body: payload });
     state.chatDraft = '';
@@ -2291,7 +2459,7 @@ async function startMatch({ quick = false } = {}) {
   } catch (error) {
     showError(error);
   } finally {
-    if (document.contains(button)) setButtonBusy(button, false);
+    buttons.forEach(button => { if (document.contains(button)) setButtonBusy(button, false); });
   }
 }
 
@@ -2444,7 +2612,7 @@ async function askDafeiyu(form) {
   try {
     const result = await api(`/api/matches/${encodeURIComponent(matchId)}/chat`, {
       method: 'POST',
-      body: { text: question },
+      body: { text: question, analysis:state.deepAnalysis },
     });
     mergeMatchSnapshot(result.match);
   } catch (error) {
@@ -2573,6 +2741,7 @@ async function handleClick(event) {
       state.lobby.gameId = actionElement.dataset.game;
       ensureLobbyGame(state.lobby.gameId);
       renderLobby();
+      document.querySelector('.game-card.selected')?.focus({ preventScroll: true });
       break;
     case 'check-health':
       setButtonBusy(actionElement, true);
@@ -2627,6 +2796,33 @@ async function handleClick(event) {
     case 'play-cell':
       await submitAction({ cell: Number(actionElement.dataset.cell) });
       break;
+    case 'splendor-action':
+      await submitAction({ action: actionElement.dataset.move });
+      break;
+    case 'blokus-piece':
+    case 'blokus-rotate':
+    case 'blokus-flip':
+    case 'blokus-cell':
+    case 'blokus-cancel':
+    case 'blokus-confirm': {
+      if (!state.match) break;
+      const canPlay = Boolean(state.match.controls?.isHumanTurn
+        && !state.match.pending
+        && state.match.status === 'playing'
+        && !state.actionBusy);
+      const outcome = handleBlokusDuoAction(action, actionElement, {
+        match: state.match,
+        view: state.match.state,
+        interactive: canPlay,
+        humanColor: state.match.controls?.humanSeat ?? null,
+      });
+      if (outcome?.action) await submitAction(outcome.action);
+      else if (outcome?.refresh) updateMatchView();
+      break;
+    }
+    case 'pause-after-move':
+      await matchControl('pause-after-move',actionElement);
+      break;
     case 'pause-match':
       await matchControl('pause', actionElement);
       break;
@@ -2674,7 +2870,10 @@ async function handleClick(event) {
 async function handleChange(event) {
   const target = event.target;
   const change = target.dataset.change;
+  if(['baseUrl','modelId'].includes(target.name)) { void syncReasoningForm(); }
   if (!change) return;
+  if(change==='deep-analysis'){state.deepAnalysis=target.checked;return;}
+  if(change==='reasoning-profile'){await syncReasoningForm();return;}
   if (change === 'seat-kind') {
     const seatId = target.dataset.seat;
     const seat = lobbySeats()[seatId];
@@ -2723,6 +2922,16 @@ async function handleChange(event) {
     await patchCurrentDafeiyu({ autoComment: target.checked });
     return;
   }
+  if (change === 'ai-pace') {
+    state.lobby.aiPace = target.value;
+    return;
+  }
+  if (change === 'player-count') {
+    state.lobby.playerCounts ??= {};
+    state.lobby.playerCounts[state.lobby.gameId] = Number(target.value);
+    renderLobby();
+    return;
+  }
   if (change === 'match-voice') {
     await patchCurrentDafeiyu({ voice: target.checked });
     return;
@@ -2759,6 +2968,9 @@ async function handleSubmit(event) {
       await applyHistoryFilters(form);
     } else if (type === 'chat') {
       await askDafeiyu(form);
+    } else if (type === 'splendor-payment') {
+      const gold = String(new FormData(form).get('gold') ?? '').trim().toUpperCase();
+      await submitAction({ action: 'buy:' + form.dataset.card + (gold ? ':' + gold : '') });
     } else if (type === 'replay-jump') {
       const data = new FormData(form);
       setReplayStep(data.get('step'));
@@ -2844,11 +3056,9 @@ async function init() {
       event.preventDefault();
       document.querySelector('#main-content')?.focus();
     });
-    window.addEventListener('beforeunload', () => {
-      if (state.route?.name === 'match' && state.match?.id) {
-        releaseMatchSession(state.match.id, '关闭或刷新页面');
-      }
-      closeMatchStream();
+    window.addEventListener('pagehide', closeMatchStream);
+    window.addEventListener('pageshow', (event) => {
+      if (event.persisted) void handleRoute();
     });
     await handleRoute();
   } catch (error) {

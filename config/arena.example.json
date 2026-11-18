@@ -14,7 +14,11 @@
       "apiKey": "local",
       "timeoutMs": 120000,
       "maxRetries": 2,
-      "isExample": true
+      "reasoningEffort": "default",
+      "maxOutputTokens": 4800,
+      "isExample": true,
+      "reasoningAdapter": "auto",
+      "thinkingMode": "default"
     }
   ],
   "dafeiyu": {
@@ -24,7 +28,11 @@
     "origin": "",
     "timeoutMs": 90000,
     "healthIntervalMs": 15000,
-    "sessionReleaseMs": 20000
+    "sessionReleaseMs": 20000,
+    "moveThinkingMode": "off",
+    "moveReasoningAdapter": "qwen",
+    "moveReasoningEffort": "default",
+    "moveMaxOutputTokens": 8192
   },
   "match": {
     "aiMoveDelayMs": 650,

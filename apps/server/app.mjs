@@ -1,3 +1,7 @@
+import { buildMatchTiming } from './match-timing.mjs';
+import { ModelMonitor, legacyRequests } from './model-monitor.mjs';
+import { ModelBenchmarks } from './model-benchmark.mjs';
+import { REASONING_PROFILES, describeReasoning, reasoningAdapter } from '../../packages/models/reasoning.mjs';
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -94,11 +98,13 @@ export async function createArenaApp({
   gamePlugins = GAME_PLUGINS,
 } = {}) {
   const configStore = new ConfigStore({ configPath });
+  const monitor = new ModelMonitor(path.join(path.dirname(configStore.configPath), 'model-monitor'));
   const hub = new EventHub({ heartbeatMs: configStore.matchSettings.sseHeartbeatMs });
   const store = new MatchStore(configStore.matchDir);
   let publicUrl = '';
   const matchService = new MatchService({
     configStore,
+    monitor,
     store,
     hub,
     logger,
@@ -107,6 +113,22 @@ export async function createArenaApp({
     originProvider: () => publicUrl.replace(/\/$/, ''),
     version: VERSION,
   });
+  const benchmarks = new ModelBenchmarks(matchService,monitor);
+  let bridgeCache={at:0,records:[],online:false};
+  async function bridgeRecords(){
+    if(Date.now()-bridgeCache.at<1500)return bridgeCache;
+    const cfg=configStore.dafeiyuSettings();
+    try{
+      const response=await fetch(cfg.bridgeUrl+cfg.apiBase+'/model-monitor',{headers:{Origin:publicUrl.replace(/\/$/,''),'X-Arena-Token':cfg.token??''},signal:AbortSignal.timeout(1200)});
+      const body=await response.json();
+      bridgeCache={at:Date.now(),records:Array.isArray(body.records)?body.records.map(row=>{
+        const match=matchService.matches.get(row.matchId);
+        const action=match?.actions.find(a=>a.requestId===row.correlationId);
+        return {...row,gameId:row.gameId??match?.gameId,step:row.step??action?.index};
+      }):[],online:response.ok};
+    }catch{bridgeCache={at:Date.now(),records:[],online:false};}
+    return bridgeCache;
+  }
   const startedAt = new Date().toISOString();
 
   function bootstrap() {
@@ -119,6 +141,7 @@ export async function createArenaApp({
       },
       games: matchService.games,
       providers: listProviders(),
+      reasoningProfiles: REASONING_PROFILES,
       models: configStore.listModels(),
       dafeiyu: configStore.publicDafeiyuSettings(),
       builtInBot: {
@@ -198,6 +221,56 @@ export async function createArenaApp({
     const pathname = url.pathname;
     const method = req.method;
 
+    if (pathname === '/api/desktop-companion' && ['GET', 'POST'].includes(method)) {
+      if (req.headers['x-arena-desktop'] !== '1') {
+        sendError(res, 403, 'desktop_only', '此接口供本机桌宠客户端使用。');
+        return;
+      }
+      const state = matchService.desktopCompanion();
+      if (method === 'POST') {
+        const body = await readJson(req);
+        if (!state.active || state.matchId !== body.matchId) {
+          sendError(res, 409, 'old_match', '当前对局已经变化。');
+          return;
+        }
+        if (body.type === 'question') await matchService.askDafeiyu(state.matchId, { text: body.text });
+        else if (body.type === 'auto' && typeof body.value === 'boolean') await matchService.patchDafeiyu(state.matchId, { autoComment: body.value });
+        else if (body.type === 'voice' && typeof body.value === 'boolean') await matchService.patchDafeiyu(state.matchId, { voice: body.value });
+        else { sendError(res, 400, 'invalid_desktop_command', '无效的桌宠操作。'); return; }
+      }
+      sendJson(res, 200, { state: matchService.desktopCompanion() }, { 'Cache-Control': 'no-store' });
+      return;
+    }
+
+    if(method==='POST' && pathname==='/api/models/reasoning-preview'){
+      const body=await readJson(req); const adapter=reasoningAdapter(body);
+      if(!REASONING_PROFILES[adapter])throw Object.assign(new Error('未知的推理协议'),{status:400,code:'invalid_reasoning'});
+      sendJson(res,200,{reasoning:describeReasoning(body),profile:REASONING_PROFILES[adapter]});return;
+    }
+    if(method==='GET' && pathname==='/api/monitor/export'){
+      const bridge=await bridgeRecords();
+      const filters=Object.fromEntries(['matchId','modelId','gameId','effort','task','pace','moveMode','origin','benchmarkId'].map(k=>[k,url.searchParams.get(k)||'']));
+      const report=monitor.snapshot({historical:legacyRequests(matchService.matches.values()),external:bridge.records,filters,limit:20000});
+      sendJson(res,200,report,{'Content-Disposition':'attachment; filename="model-monitor.json"','Cache-Control':'no-store'});return;
+    }
+    const matchTimingRoute=method==='GET' && matchRoute(pathname,/^\/api\/monitor\/matches\/([^/]+)$/);
+    if(matchTimingRoute){
+      const match=matchService.getMatch(matchTimingRoute[0]);
+      const bridge=await bridgeRecords();
+      const report=monitor.snapshot({historical:legacyRequests(matchService.matches.values()),external:bridge.records,filters:{matchId:match.id},limit:20000});
+      sendJson(res,200,buildMatchTiming(match,report.recent,report.active),{'Cache-Control':'no-store'});return;
+    }
+    if(method==='GET' && pathname==='/api/monitor'){
+      const bridge=await bridgeRecords();
+      const filters=Object.fromEntries(['matchId','modelId','gameId','effort','task','pace','moveMode','origin','benchmarkId'].map(k=>[k,url.searchParams.get(k)||'']));
+      sendJson(res,200,{...monitor.snapshot({historical:legacyRequests(matchService.matches.values()),external:bridge.records,filters}),
+        bridgeOnline:bridge.online,benchmarks:benchmarks.list(),matches:matchService.listMatches()},{'Cache-Control':'no-store'});return;
+    }
+    if(method==='POST' && pathname==='/api/monitor/benchmarks'){
+      sendJson(res,202,{benchmark:benchmarks.start(await readJson(req))});return;
+    }
+    const benchmarkCancel=method==='POST' && matchRoute(pathname,/^\/api\/monitor\/benchmarks\/([a-f0-9-]+)\/cancel$/);
+    if(benchmarkCancel){sendJson(res,200,{ok:benchmarks.cancel(benchmarkCancel[0])});return;}
     if (method === 'GET' && pathname === '/api/health') {
       sendJson(res, 200, {
         ok: true,
@@ -347,9 +420,20 @@ export async function createArenaApp({
       res.write(`retry: 3000\n\n`);
       res.write(`event: match\ndata: ${JSON.stringify(snapshot)}\n\n`);
       const unsubscribe = hub.subscribe(id, res);
-      const close = () => unsubscribe();
-      req.on('close', close);
-      req.on('aborted', close);
+      matchService.cancelViewerRelease(id);
+      res.once('close', () => {
+        unsubscribe();
+        matchService.scheduleViewerRelease(id);
+      });
+      return;
+    }
+    const privateView = method === 'GET' && matchRoute(pathname, /^\/api\/matches\/([^/]+)\/human-view$/);
+    if (privateView) {
+      if (req.headers['x-arena-human-view'] !== '1') {
+        sendError(res, 403, 'private_view', '需要本机牌桌才能查看真人席位。');
+        return;
+      }
+      sendJson(res, 200, { view: matchService.humanView(privateView[0]) }, { 'Cache-Control': 'no-store' });
       return;
     }
     const replay = method === 'GET' && matchRoute(pathname, /^\/api\/matches\/([^/]+)\/replay$/);
@@ -394,6 +478,8 @@ export async function createArenaApp({
       sendJson(res, 200, { match });
       return;
     }
+    const pauseAfterRoute=method==='POST' && matchRoute(pathname,/^\/api\/matches\/([^/]+)\/pause-after-move$/);
+    if(pauseAfterRoute){sendJson(res,200,{match:matchService.pauseAfterMove(pauseAfterRoute[0])});return;}
     const resumeRoute = method === 'POST' && matchRoute(pathname, /^\/api\/matches\/([^/]+)\/resume$/);
     if (resumeRoute) {
       const [id] = resumeRoute;
@@ -427,7 +513,7 @@ export async function createArenaApp({
     if (chatRoute) {
       const [id] = chatRoute;
       const body = await readJson(req);
-      const match = await matchService.askDafeiyu(id, { text: body.text, voice: body.voice });
+      const match = await matchService.askDafeiyu(id, { text: body.text, voice: body.voice, analysis:body.analysis === true });
       sendJson(res, 200, { match });
       return;
     }
@@ -539,6 +625,8 @@ export async function createArenaApp({
     store,
     hub,
     matchService,
+    monitor,
+    benchmarks,
     get publicUrl() {
       return publicUrl;
     },
@@ -566,8 +654,10 @@ export async function createArenaApp({
       return { url: publicUrl, port: actualPort, host };
     },
     async close() {
+      await benchmarks.close();
+      const closingMatches = matchService.close();
       hub.close();
-      await matchService.close();
+      await closingMatches;
       await new Promise((resolve) => {
         server.close(() => resolve());
         server.closeAllConnections?.();
